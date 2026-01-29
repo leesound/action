@@ -2,36 +2,73 @@ name: WeirdHost 自动续期
 
 on:
   schedule:
-    - cron: '15 16 * * *'  # UTC 16:15 = 北京时间 00:15
+    - cron: '15 16 * * *'  # 每天北京时间 00:15
   workflow_dispatch:
+    inputs:
+      force_renew:
+        description: '强制续期'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: write
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
-          pip install --upgrade pip
-          pip install seleniumbase aiohttp pyvirtualdisplay
+          sudo apt-get install -y \
+            xvfb \
+            libgtk-3-0 \
+            libnotify-dev \
+            libnss3 \
+            libxss1 \
+            libasound2t64 \
+            libxtst6 \
+            xauth \
+            fonts-liberation \
+            libgbm1 \
+            libxkbcommon0 \
+            libvulkan1 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libpango-1.0-0 \
+            libcairo2 \
+            wget \
+            curl
 
-      - name: Download Hysteria2
+      - name: 安装 Python 依赖
+        run: |
+          pip install --upgrade pip
+          pip install seleniumbase pyvirtualdisplay aiohttp
+          seleniumbase install chromedriver
+          seleniumbase install chrome
+
+      - name: 下载 Hysteria2
         run: |
           wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
           chmod +x hysteria
 
-      - name: Configure Hysteria2
+      - name: 配置 Hysteria2
         env:
           HY2_URL: ${{ secrets.HY2_URL }}
         run: |
@@ -69,44 +106,44 @@ jobs:
           
           echo "✅ Hysteria2 配置完成"
 
-      - name: Start Proxy
+      - name: 启动代理
         run: |
           if [ -f "hy2-config.yaml" ]; then
             ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
             sleep 3
             
             if curl -s --proxy http://127.0.0.1:8080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
-              echo "✅ 代理已启动"
+              echo "✅ 代理已启动并可用"
               echo "USE_PROXY=true" >> $GITHUB_ENV
             else
-              echo "⚠️ 代理可能不可用"
+              echo "⚠️ 代理启动但可能不可用，继续执行..."
               cat hysteria.log || true
             fi
           else
-            echo "⚠️ 无代理配置"
+            echo "⚠️ 无代理配置，直接连接"
           fi
 
-      - name: Run WeirdHost Renew
+      - name: 运行续期脚本
         env:
           WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
           WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          HTTP_PROXY: http://127.0.0.1:8080
+          USE_PROXY: ${{ env.USE_PROXY }}
         run: |
           python scripts/weirdhost_renew.py
 
-      - name: Cleanup
+      - name: 清理
         if: always()
         run: |
           pkill -f hysteria || true
 
-      - name: Delete old runs
+      - name: 删除旧运行记录
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
+          delete_workflow_pattern: "WeirdHost 自动续期"
           retain_days: 0
           keep_minimum_runs: 3
