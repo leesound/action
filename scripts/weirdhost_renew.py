@@ -13,7 +13,6 @@ WeirdHost 自动续期脚本 (单文件完整版)
 环境变量：
   - WEIRDHOST_EMAIL    : 登录邮箱（必须）
   - WEIRDHOST_PASSWORD : 登录密码（必须）
-  - HTTP_PROXY         : HTTP 代理地址（可选，默认 http://127.0.0.1:8080）
   - USE_PROXY          : 是否使用代理（可选，设为 "true" 启用）
   - TG_BOT_TOKEN       : Telegram Bot Token（可选）
   - TG_CHAT_ID         : Telegram Chat ID（可选）
@@ -35,8 +34,10 @@ BASE_URL = "https://hub.weirdhost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 DASHBOARD_URL = f"{BASE_URL}/"
 
-# 默认代理地址（由 workflow 中的 HY2 提供）
-DEFAULT_PROXY = "http://127.0.0.1:8080"
+# 代理配置
+PROXY_HOST = "127.0.0.1"
+PROXY_HTTP_PORT = 8080
+PROXY_SOCKS_PORT = 1080
 
 # 冷却期关键词（韩文：还不能续期）
 COOLDOWN_KEYWORDS = [
@@ -60,15 +61,10 @@ def is_github_actions() -> bool:
     return os.environ.get("GITHUB_ACTIONS") == "true"
 
 
-def get_proxy() -> Optional[str]:
-    """获取代理配置"""
+def should_use_proxy() -> bool:
+    """判断是否应该使用代理"""
     use_proxy = os.environ.get("USE_PROXY", "").strip().lower()
-    
-    if use_proxy == "true" or os.environ.get("HY2_URL"):
-        proxy = os.environ.get("HTTP_PROXY", DEFAULT_PROXY).strip()
-        return proxy if proxy else DEFAULT_PROXY
-    
-    return None
+    return use_proxy == "true"
 
 
 def mask_string(s: str, show_chars: int = 2) -> str:
@@ -158,8 +154,8 @@ def is_cooldown_error(error_msg: str) -> bool:
 class TurnstileBypasser:
     """Cloudflare Turnstile 绕过器"""
 
-    def __init__(self, proxy: Optional[str] = None, headless: bool = True):
-        self.proxy = proxy
+    def __init__(self, use_proxy: bool = False, headless: bool = True):
+        self.use_proxy = use_proxy
         self.headless = headless
         self.display = None
         self.sb = None
@@ -192,9 +188,12 @@ class TurnstileBypasser:
             "headless": False if is_linux() else self.headless,
         }
 
-        if self.proxy:
-            sb_kwargs["proxy"] = self.proxy
-            print(f"[Turnstile] 使用代理: {self.proxy}")
+        # 使用 SOCKS5 代理（更稳定）
+        if self.use_proxy:
+            # SeleniumBase 格式: socks5://host:port
+            proxy_str = f"socks5://{PROXY_HOST}:{PROXY_SOCKS_PORT}"
+            sb_kwargs["proxy"] = proxy_str
+            print(f"[Turnstile] 使用代理: {proxy_str}")
 
         self._sb_context = SB(**sb_kwargs)
         self.sb = self._sb_context.__enter__()
@@ -335,10 +334,10 @@ async def tg_notify(message: str):
 class WeirdHostRenewer:
     """WeirdHost 自动续期器"""
 
-    def __init__(self, email: str, password: str, proxy: Optional[str] = None):
+    def __init__(self, email: str, password: str, use_proxy: bool = False):
         self.email = email
         self.password = password
-        self.proxy = proxy
+        self.use_proxy = use_proxy
         self.bypasser: Optional[TurnstileBypasser] = None
         self.logged_in = False
         self.servers: List[Dict] = []
@@ -349,11 +348,11 @@ class WeirdHostRenewer:
         print("WeirdHost 自动续期脚本")
         print(f"{'=' * 60}")
         print(f"账号: {mask_email(self.email)}")
-        print(f"代理: {self.proxy or '未使用'}")
+        print(f"代理: {'SOCKS5 127.0.0.1:1080' if self.use_proxy else '未使用'}")
         print(f"执行: {get_executor_name()}")
         print(f"{'=' * 60}\n")
 
-        self.bypasser = TurnstileBypasser(proxy=self.proxy, headless=True)
+        self.bypasser = TurnstileBypasser(use_proxy=self.use_proxy, headless=True)
         self.bypasser.start()
 
     def stop(self):
@@ -517,15 +516,6 @@ class WeirdHostRenewer:
     def click_renew_and_get_result(self, server_id: str) -> Dict[str, Any]:
         """
         点击续期按钮并获取 API 响应结果
-        
-        Returns:
-            {
-                "clicked": bool,
-                "api_success": bool or None,
-                "api_status": int or None,
-                "api_message": str,
-                "is_cooldown": bool
-            }
         """
         result = {
             "clicked": False,
@@ -658,7 +648,7 @@ class WeirdHostRenewer:
             "expiry_after": None,
             "remaining_days": None,
             "is_cooldown": False,
-            "should_notify": False  # 是否需要发送通知
+            "should_notify": False
         }
 
         server_url = server.get("url", "")
@@ -857,26 +847,32 @@ async def main():
         print("❌ 请设置 WEIRDHOST_EMAIL 和 WEIRDHOST_PASSWORD 环境变量")
         sys.exit(1)
 
-    # 获取代理配置
-    proxy = get_proxy()
+    # 判断是否使用代理
+    use_proxy = should_use_proxy()
 
-    # 如果有代理，测试连接
-    if proxy:
-        print(f"[代理] 使用: {proxy}")
+    if use_proxy:
+        print(f"[代理] 将使用 SOCKS5 代理: {PROXY_HOST}:{PROXY_SOCKS_PORT}")
+        # 测试代理连接
         try:
-            import urllib.request
-            proxy_handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy})
-            opener = urllib.request.build_opener(proxy_handler)
-            opener.open("http://httpbin.org/ip", timeout=10)
-            print("[代理] ✓ 连接正常")
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((PROXY_HOST, PROXY_SOCKS_PORT))
+            sock.close()
+            if result == 0:
+                print("[代理] ✓ 端口可达")
+            else:
+                print("[代理] ⚠ 端口不可达，继续尝试...")
         except Exception as e:
-            print(f"[代理] ⚠ 测试失败: {e}，继续执行...")
+            print(f"[代理] ⚠ 测试失败: {e}")
+    else:
+        print("[代理] 未启用代理")
 
     try:
         renewer = WeirdHostRenewer(
             email=email,
             password=password,
-            proxy=proxy
+            use_proxy=use_proxy
         )
 
         results = await renewer.run()
@@ -885,11 +881,11 @@ async def main():
         if results:
             success_count = sum(1 for r in results if r["success"])
             cooldown_count = sum(1 for r in results if r["is_cooldown"])
-            
+
             # 有成功或全是冷却期都算正常
             if success_count > 0 or cooldown_count == len(results):
                 sys.exit(0)
-        
+
         sys.exit(1)
 
     except KeyboardInterrupt:
