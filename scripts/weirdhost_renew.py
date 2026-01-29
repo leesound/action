@@ -132,7 +132,7 @@ def is_cooldown_error(error_msg: str) -> bool:
 
 
 # ============================================================
-# Turnstile 绕过模块
+# Turnstile 绕过模块 (优化版)
 # ============================================================
 class TurnstileBypasser:
     def __init__(self, use_proxy: bool = False, headless: bool = True):
@@ -162,7 +162,7 @@ class TurnstileBypasser:
             "uc": True,
             "test": True,
             "locale": "en",
-            "headless": False if is_linux() else self.headless,
+            "headless": False,  # Turnstile 需要非 headless
         }
 
         if self.use_proxy:
@@ -186,35 +186,184 @@ class TurnstileBypasser:
             except:
                 pass
 
+    def _click_turnstile_checkbox(self) -> bool:
+        """尝试多种方式点击 Turnstile 复选框"""
+        
+        # 方法1: 使用 SeleniumBase 内置方法
+        try:
+            self.sb.uc_gui_click_captcha()
+            print("[Turnstile] 方法1: uc_gui_click_captcha")
+            return True
+        except Exception as e:
+            print(f"[Turnstile] 方法1失败: {e}")
+
+        # 方法2: 直接点击 iframe 中的复选框
+        try:
+            # 查找 Turnstile iframe
+            iframes = self.sb.find_elements("iframe")
+            for iframe in iframes:
+                src = iframe.get_attribute("src") or ""
+                if "challenges.cloudflare" in src or "turnstile" in src:
+                    self.sb.switch_to_frame(iframe)
+                    time.sleep(0.5)
+                    
+                    # 尝试点击复选框
+                    checkbox_selectors = [
+                        "input[type='checkbox']",
+                        ".cf-turnstile-wrapper input",
+                        "#cf-turnstile-response",
+                        "[class*='checkbox']",
+                    ]
+                    
+                    for selector in checkbox_selectors:
+                        try:
+                            self.sb.click(selector, timeout=2)
+                            print(f"[Turnstile] 方法2: 点击 {selector}")
+                            self.sb.switch_to_default_content()
+                            return True
+                        except:
+                            pass
+                    
+                    self.sb.switch_to_default_content()
+        except Exception as e:
+            print(f"[Turnstile] 方法2失败: {e}")
+            try:
+                self.sb.switch_to_default_content()
+            except:
+                pass
+
+        # 方法3: 使用坐标点击 (Turnstile 复选框通常在固定位置)
+        try:
+            # 查找 Turnstile 容器
+            container = self.sb.execute_script('''
+                var cf = document.querySelector('[class*="cf-turnstile"]') ||
+                         document.querySelector('iframe[src*="challenges.cloudflare"]');
+                if (cf) {
+                    var rect = cf.getBoundingClientRect();
+                    return {x: rect.left + 35, y: rect.top + 35};  // 复选框通常在左上角
+                }
+                return null;
+            ''')
+            
+            if container:
+                from selenium.webdriver.common.action_chains import ActionChains
+                actions = ActionChains(self.sb.driver)
+                actions.move_by_offset(int(container['x']), int(container['y'])).click().perform()
+                actions.move_by_offset(-int(container['x']), -int(container['y'])).perform()
+                print(f"[Turnstile] 方法3: 坐标点击 ({container['x']}, {container['y']})")
+                return True
+        except Exception as e:
+            print(f"[Turnstile] 方法3失败: {e}")
+
+        # 方法4: 使用 pyautogui 模拟点击
+        try:
+            import pyautogui
+            
+            # 获取 Turnstile 位置
+            pos = self.sb.execute_script('''
+                var cf = document.querySelector('[class*="cf-turnstile"]') ||
+                         document.querySelector('iframe[src*="challenges.cloudflare"]');
+                if (cf) {
+                    var rect = cf.getBoundingClientRect();
+                    return {x: rect.left + 35, y: rect.top + 35};
+                }
+                return null;
+            ''')
+            
+            if pos:
+                # 获取浏览器窗口位置
+                window_pos = self.sb.execute_script('''
+                    return {x: window.screenX, y: window.screenY + (window.outerHeight - window.innerHeight)};
+                ''')
+                
+                click_x = window_pos['x'] + pos['x']
+                click_y = window_pos['y'] + pos['y']
+                
+                pyautogui.click(click_x, click_y)
+                print(f"[Turnstile] 方法4: pyautogui 点击 ({click_x}, {click_y})")
+                return True
+        except Exception as e:
+            print(f"[Turnstile] 方法4失败: {e}")
+
+        return False
+
+    def _is_turnstile_present(self) -> bool:
+        """检测是否存在 Turnstile 验证"""
+        try:
+            page_source = self.sb.get_page_source().lower()
+            indicators = [
+                "challenges.cloudflare",
+                "cf-turnstile",
+                "turnstile",
+                "确认您是真人",
+                "verify you are human",
+                "checking your browser",
+                "just a moment",
+            ]
+            return any(x in page_source for x in indicators)
+        except:
+            return False
+
+    def _is_turnstile_solved(self) -> bool:
+        """检测 Turnstile 是否已解决"""
+        try:
+            page_source = self.sb.get_page_source().lower()
+            
+            # 如果页面不再包含验证相关内容，说明已通过
+            cf_indicators = [
+                "challenges.cloudflare",
+                "确认您是真人",
+                "verify you are human",
+                "checking your browser",
+                "just a moment",
+            ]
+            
+            # 检查是否还在验证页面
+            if not any(x in page_source for x in cf_indicators):
+                return True
+            
+            # 检查是否有成功标志
+            success_indicators = [
+                "success",
+                "verified",
+            ]
+            
+            return any(x in page_source for x in success_indicators)
+        except:
+            return False
+
     def wait_for_turnstile(self, timeout: int = 120) -> bool:
+        """等待并处理 Turnstile 验证"""
         print("[Turnstile] 检测验证...")
 
-        cf_indicators = [
-            "turnstile", "challenges.cloudflare", "just a moment",
-            "verify you are human", "checking your browser", "cf-challenge"
-        ]
+        click_attempts = [5, 10, 15, 20, 30, 45, 60, 80, 100]
+        click_index = 0
 
         for i in range(timeout):
             try:
-                page_source = self.sb.get_page_source().lower()
-                has_cf = any(x in page_source for x in cf_indicators)
-
-                if not has_cf:
+                # 检查是否已通过
+                if not self._is_turnstile_present():
                     print(f"[Turnstile] ✓ 通过 ({i + 1}s)")
                     return True
 
-                if i in [3, 8, 15, 25, 40, 60, 90]:
-                    try:
-                        self.sb.uc_gui_click_captcha()
-                        time.sleep(2)
-                    except:
-                        pass
+                # 在特定时间点尝试点击
+                if click_index < len(click_attempts) and i >= click_attempts[click_index]:
+                    print(f"[Turnstile] 尝试点击... ({i}s)")
+                    self._click_turnstile_checkbox()
+                    click_index += 1
+                    time.sleep(3)
+                    
+                    # 点击后立即检查
+                    if not self._is_turnstile_present():
+                        print(f"[Turnstile] ✓ 通过 ({i + 1}s)")
+                        return True
 
                 if i % 20 == 0 and i > 0:
                     print(f"[Turnstile] 等待中... ({i}s)")
 
                 time.sleep(1)
-            except:
+            except Exception as e:
+                print(f"[Turnstile] 检测异常: {e}")
                 time.sleep(1)
 
         print("[Turnstile] ✗ 超时")
@@ -222,9 +371,13 @@ class TurnstileBypasser:
 
     def open_url(self, url: str, wait_cf: bool = True) -> bool:
         try:
+            print(f"[Turnstile] 打开: {url}")
             self.sb.uc_open_with_reconnect(url, reconnect_time=5.0)
-            time.sleep(2)
-            return self.wait_for_turnstile() if wait_cf else True
+            time.sleep(3)
+            
+            if wait_cf:
+                return self.wait_for_turnstile()
+            return True
         except Exception as e:
             print(f"[Turnstile] 打开失败: {e}")
             return False
@@ -250,9 +403,9 @@ class TurnstileBypasser:
     def screenshot(self, path: str):
         try:
             self.sb.save_screenshot(path)
+            print(f"[Turnstile] 截图: {path}")
         except:
             pass
-
 
 # ============================================================
 # Telegram 通知
