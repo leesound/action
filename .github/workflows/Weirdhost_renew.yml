@@ -1,45 +1,108 @@
-name: Weirdhost 提醒续订
+name: WeirdHost 自动续期
+
 on:
   schedule:
-    - cron: '15 16 * * *'  # 每天北京时间 00:15 运行
-  workflow_dispatch:      # 支持手动触发
+    - cron: '15 16 * * *'  # UTC 16:15 = 北京时间 00:15
+  workflow_dispatch:
 
 jobs:
-  add_time:
+  renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright aiohttp pynacl
-          playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install --upgrade pip
+          pip install seleniumbase aiohttp pyvirtualdisplay
 
-      - name: Run weirdhost-auto
+      - name: Download Hysteria2
+        run: |
+          wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
+          chmod +x hysteria
+
+      - name: Configure Hysteria2
         env:
-          # Cookie 登录
-          REMEMBER_WEB_COOKIE: ${{ secrets.REMEMBER_WEB_COOKIE }}
-          REMEMBER_WEB_COOKIE_NAME: ${{ secrets.REMEMBER_WEB_COOKIE_NAME }}
-          # 目标服务器
-          # SERVER_URL: ${{ secrets.SERVER_URL }}
-          # Telegram 通知
+          HY2_URL: ${{ secrets.HY2_URL }}
+        run: |
+          if [ -z "$HY2_URL" ]; then
+            echo "⚠️ HY2_URL 未设置，跳过代理配置"
+            exit 0
+          fi
+          
+          URL_BODY="${HY2_URL#hysteria2://}"
+          URL_BODY="${URL_BODY%%#*}"
+          PASSWORD="${URL_BODY%%@*}"
+          SERVER_PART="${URL_BODY#*@}"
+          SERVER="${SERVER_PART%%\?*}"
+          PARAMS="${SERVER_PART#*\?}"
+          
+          get_param() { echo "$PARAMS" | tr '&' '\n' | grep "^$1=" | cut -d'=' -f2; }
+          
+          SNI=$(get_param "sni")
+          INSECURE=$(get_param "insecure")
+          
+          [ -z "$SNI" ] && SNI="${SERVER%%:*}"
+          [ "$INSECURE" = "1" ] && INSECURE="true" || INSECURE="false"
+          
+          cat > hy2-config.yaml << EOF
+          server: ${SERVER}
+          auth: ${PASSWORD}
+          tls:
+            sni: ${SNI}
+            insecure: ${INSECURE}
+          socks5:
+            listen: 127.0.0.1:1080
+          http:
+            listen: 127.0.0.1:8080
+          EOF
+          
+          echo "✅ Hysteria2 配置完成"
+
+      - name: Start Proxy
+        run: |
+          if [ -f "hy2-config.yaml" ]; then
+            ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
+            sleep 3
+            
+            if curl -s --proxy http://127.0.0.1:8080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
+              echo "✅ 代理已启动"
+              echo "USE_PROXY=true" >> $GITHUB_ENV
+            else
+              echo "⚠️ 代理可能不可用"
+              cat hysteria.log || true
+            fi
+          else
+            echo "⚠️ 无代理配置"
+          fi
+
+      - name: Run WeirdHost Renew
+        env:
+          WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
+          WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 自动更新 Cookie 到 Secrets
-          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          HTTP_PROXY: http://127.0.0.1:8080
         run: |
           python scripts/weirdhost_renew.py
 
-      - name: 清理工作流记录
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f hysteria || true
+
+      - name: Delete old runs
+        if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
