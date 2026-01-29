@@ -59,7 +59,7 @@ jobs:
       - name: 安装 Python 依赖
         run: |
           pip install --upgrade pip
-          pip install seleniumbase pyvirtualdisplay aiohttp
+          pip install seleniumbase pyvirtualdisplay aiohttp pyautogui
           seleniumbase install chromedriver
           seleniumbase install chrome
 
