@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WeirdHost 自动续期脚本 v7
-使用 Cookie 跳过登录
+WeirdHost 自动续期脚本 v8
 """
 
 import os
@@ -44,13 +43,16 @@ def encrypt_secret(public_key: str, secret_value: str) -> str:
 # 工具函数
 # ============================================================
 def mask_string(s: str, show: int = 4) -> str:
-    if not s or len(s) <= show * 2:
-        return s or "***"
+    """遮蔽敏感信息，只显示前后几个字符"""
+    if not s:
+        return "***"
+    if len(s) <= show * 2:
+        return "*" * len(s)
     return f"{s[:show]}****{s[-show:]}"
 
 
 def parse_cookie(cookie_str: str) -> tuple:
-    """解析 name=value 格式的 Cookie，自动处理 URL 编码"""
+    """解析 Cookie，自动处理 URL 编码"""
     cookie_str = unquote(cookie_str.strip())
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
@@ -165,7 +167,7 @@ async def update_github_secret(secret_name: str, secret_value: str) -> bool:
             payload = {"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]}
             async with session.put(secret_url, headers=headers, json=payload) as resp:
                 if resp.status in (201, 204):
-                    print(f"[GitHub] ✓ Secret {secret_name} 已更新")
+                    print("[GitHub] ✓ Cookie 已更新")
                     return True
                 return False
         except:
@@ -263,8 +265,17 @@ async def get_expiry_time(page: Page) -> str:
         return "Unknown"
 
 
-async def find_and_click_renew_button(page: Page) -> bool:
-    try:
+async def scroll_and_find_renew_button(page: Page) -> bool:
+    """滚动页面并查找续期按钮"""
+    print("[续期] 滚动页面查找按钮...")
+    
+    # 先尝试直接查找
+    for attempt in range(5):
+        # 滚动页面
+        await page.evaluate(f"window.scrollBy(0, {300 * (attempt + 1)})")
+        await page.wait_for_timeout(500)
+        
+        # 查找并点击按钮
         clicked = await page.evaluate("""
             () => {
                 const buttons = document.querySelectorAll('button, a, [role="button"]');
@@ -273,7 +284,8 @@ async def find_and_click_renew_button(page: Page) -> bool:
                     const text = (btn.textContent || btn.innerText || '').toLowerCase();
                     for (const kw of keywords) {
                         if (text.includes(kw.toLowerCase())) {
-                            btn.click();
+                            // 滚动到按钮位置
+                            btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
                             return true;
                         }
                     }
@@ -281,9 +293,52 @@ async def find_and_click_renew_button(page: Page) -> bool:
                 return false;
             }
         """)
-        return clicked
-    except:
-        return False
+        
+        if clicked:
+            await page.wait_for_timeout(1000)
+            # 再次点击确保触发
+            await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll('button, a, [role="button"]');
+                    const keywords = ['시간추가', '시간연장', '연장', '갱신', 'renew', 'extend', 'add time'];
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || btn.innerText || '').toLowerCase();
+                        for (const kw of keywords) {
+                            if (text.includes(kw.toLowerCase())) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            return True
+    
+    # 尝试滚动到底部
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1000)
+    
+    # 最后一次尝试
+    clicked = await page.evaluate("""
+        () => {
+            const buttons = document.querySelectorAll('button, a, [role="button"]');
+            const keywords = ['시간추가', '시간연장', '연장', '갱신', 'renew', 'extend', 'add time'];
+            for (const btn of buttons) {
+                const text = (btn.textContent || btn.innerText || '').toLowerCase();
+                for (const kw of keywords) {
+                    if (text.includes(kw.toLowerCase())) {
+                        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        setTimeout(() => btn.click(), 500);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    """)
+    
+    return clicked
 
 
 async def click_confirm_button(page: Page):
@@ -331,11 +386,8 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         "is_cooldown": False,
     }
     
-    server_id = server_url.split("/")[-1]
-    masked_id = mask_string(server_id)
-    
     print(f"\n{'=' * 50}")
-    print(f"[续期] {masked_id}")
+    print("[续期] 开始处理...")
     print('=' * 50)
     
     renew_result = {"captured": False, "status": None, "body": None}
@@ -356,7 +408,7 @@ async def renew_server(page: Page, server_url: str) -> Dict:
     page.on("response", capture_response)
     
     try:
-        print(f"[续期] 访问: {server_url}")
+        print("[续期] 访问服务器页面...")
         await page.goto(server_url, timeout=60000)
         await wait_for_cloudflare(page, timeout=90)
         await page.wait_for_timeout(2000)
@@ -372,10 +424,10 @@ async def renew_server(page: Page, server_url: str) -> Dict:
             remaining = calculate_remaining_time(result["expiry_before"])
             print(f"[续期] 当前到期: {result['expiry_before']} ({remaining})")
         
-        await page.screenshot(path=f"server_{masked_id[:8]}.png")
+        await page.screenshot(path="server_page.png")
         
-        print("[续期] 查找续期按钮...")
-        if not await find_and_click_renew_button(page):
+        # 使用新的滚动查找函数
+        if not await scroll_and_find_renew_button(page):
             result["message"] = "未找到续期按钮"
             print(f"[续期] ✗ {result['message']}")
             await page.screenshot(path="no_button.png")
@@ -462,11 +514,10 @@ async def main():
     cookie_name, cookie_value = parse_cookie(cookie_str)
     
     print(f"\n{'=' * 60}")
-    print("WeirdHost 自动续期脚本 v7")
+    print("WeirdHost 自动续期脚本 v8")
     print(f"{'=' * 60}")
-    print(f"Cookie Name: {cookie_name}")
-    print(f"Cookie Value: {mask_string(cookie_value, 8)}")
-    print(f"Server: {server_url}")
+    print(f"Cookie: {mask_string(cookie_name)}={mask_string(cookie_value, 8)}")
+    print(f"Server: [已隐藏]")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'=' * 60}")
     
@@ -497,7 +548,7 @@ async def main():
         page.set_default_timeout(60000)
         
         try:
-            print(f"[Cookie] 设置: {cookie_name}")
+            print("[Cookie] 设置中...")
             await context.add_cookies([{
                 "name": cookie_name,
                 "value": cookie_value,
@@ -509,7 +560,7 @@ async def main():
             
             new_cookie = await extract_cookie(context)
             if new_cookie and new_cookie != cookie_str:
-                print("\n[Cookie] 检测到新 Cookie，尝试更新...")
+                print("\n[Cookie] 检测到更新...")
                 await update_github_secret("WEIRDHOST_COOKIE", new_cookie)
             
             if result["success"]:
