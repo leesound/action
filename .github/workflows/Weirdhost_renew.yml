@@ -89,8 +89,7 @@ jobs:
 
       - name: 运行脚本
         env:
-          REMEMBER_WEB_COOKIE: ${{ secrets.REMEMBER_WEB_COOKIE }}
-          REMEMBER_WEB_COOKIE_NAME: ${{ secrets.REMEMBER_WEB_COOKIE_NAME }}
+          WEIRDHOST_COOKIES: ${{ secrets.WEIRDHOST_COOKIES }}
           SERVER_URL: ${{ secrets.SERVER_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
