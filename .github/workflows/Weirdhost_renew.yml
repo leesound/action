@@ -8,7 +8,7 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     
     steps:
       - name: 检出代码
@@ -19,31 +19,66 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+      - name: 安装依赖
+        run: pip install pynacl
       
-      - name: 安装 Python 依赖
+      - name: 下载 Hysteria2
+        if: ${{ secrets.HY2_URL != '' }}
         run: |
-          pip install seleniumbase pynacl pyvirtualdisplay
-          seleniumbase install chromedriver
+          wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
+          chmod +x hysteria
+      
+      - name: 配置并启动代理
+        if: ${{ secrets.HY2_URL != '' }}
+        env:
+          HY2_URL: ${{ secrets.HY2_URL }}
+        run: |
+          if [ -z "$HY2_URL" ]; then
+            echo "⚠️ HY2_URL 未设置，跳过代理配置"
+            exit 0
+          fi
+          
+          URL_BODY="${HY2_URL#hysteria2://}"
+          URL_BODY="${URL_BODY%%#*}"
+          PASSWORD="${URL_BODY%%@*}"
+          SERVER_PART="${URL_BODY#*@}"
+          SERVER="${SERVER_PART%%\?*}"
+          PARAMS="${SERVER_PART#*\?}"
+          
+          get_param() { echo "$PARAMS" | tr '&' '\n' | grep "^$1=" | cut -d'=' -f2; }
+          
+          SNI=$(get_param "sni")
+          INSECURE=$(get_param "insecure")
+          
+          [ -z "$SNI" ] && SNI="${SERVER%%:*}"
+          [ "$INSECURE" = "1" ] && INSECURE="true" || INSECURE="false"
+          
+          cat > hy2-config.yaml << EOF
+          server: ${SERVER}
+          auth: ${PASSWORD}
+          tls:
+            sni: ${SNI}
+            insecure: ${INSECURE}
+          http:
+            listen: 127.0.0.1:8080
+          EOF
+          
+          ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
+          sleep 3
+          
+          if curl -s --proxy http://127.0.0.1:8080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
+            echo "✅ 代理已启动"
+            echo "HTTP_PROXY=http://127.0.0.1:8080" >> $GITHUB_ENV
+          else
+            echo "⚠️ 代理启动失败，将直接连接"
+          fi
       
       - name: 运行续期脚本
         env:
-          WEIRDHOST_COOKIE: "${{ secrets.WEIRDHOST_COOKIE }}"
-          WEIRDHOST_SERVER_URL: "${{ secrets.WEIRDHOST_SERVER_URL }}"
-          TG_BOT_TOKEN: "${{ secrets.TG_BOT_TOKEN }}"
-          TG_CHAT_ID: "${{ secrets.TG_CHAT_ID }}"
-          REPO_TOKEN: "${{ secrets.REPO_TOKEN }}"
-          GITHUB_REPOSITORY: "${{ github.repository }}"
+          WEIRDHOST_COOKIE: ${{ secrets.WEIRDHOST_COOKIE }}
+          WEIRDHOST_SERVER_URL: ${{ secrets.WEIRDHOST_SERVER_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scripts/weirdhost_renew.py
-      
-      - name: 上传截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: "*.png"
-          retention-days: 3
-          if-no-files-found: ignore
