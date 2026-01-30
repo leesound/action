@@ -24,24 +24,23 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libglib2.0-0 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libasound2t64
+          sudo apt-get install -y xvfb
       
       - name: 安装 Python 依赖
         run: |
-          pip install seleniumbase pynacl pyvirtualdisplay
-          seleniumbase install chromedriver
+          pip install undetected-chromedriver selenium pynacl
       
       - name: 下载 Hysteria2
         run: |
           wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
           chmod +x hysteria
 
-      - name: 配置 Hysteria2
+      - name: 配置并启动代理
         env:
           HY2_URL: ${{ secrets.HY2_URL }}
         run: |
           if [ -z "$HY2_URL" ]; then
-            echo "⚠️ HY2_URL 未设置，跳过代理配置"
+            echo "⚠️ HY2_URL 未设置，跳过代理"
             exit 0
           fi
           
@@ -68,26 +67,16 @@ jobs:
             insecure: ${INSECURE}
           socks5:
             listen: 127.0.0.1:1080
-          http:
-            listen: 127.0.0.1:8080
           EOF
           
-          echo "✅ Hysteria2 配置完成"
-
-      - name: 启动代理
-        run: |
-          if [ -f "hy2-config.yaml" ]; then
-            ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
-            sleep 3
-            
-            if curl -s --proxy http://127.0.0.1:8080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
-              echo "✅ 代理已启动并可用"
-              echo "HTTP_PROXY=http://127.0.0.1:8080" >> $GITHUB_ENV
-            else
-              echo "⚠️ 代理启动但可能不可用，继续执行..."
-            fi
+          ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
+          sleep 3
+          
+          if curl -s --proxy socks5://127.0.0.1:1080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
+            echo "✅ SOCKS5 代理已启动"
+            echo "SOCKS_PROXY=socks5://127.0.0.1:1080" >> $GITHUB_ENV
           else
-            echo "⚠️ 无代理配置，直接连接"
+            echo "⚠️ 代理可能不可用"
           fi
 
       - name: 运行续期脚本
@@ -113,7 +102,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: 清理旧运行（保留最近 3 次）
+      - name: 清理旧运行
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
