@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v26
-- 使用 seleniumbase (自动管理 chromedriver)
-- 浏览器走 SOCKS5 代理
+WeirdHost 自动续期 v27
+- 通过网络请求响应判断结果
+- 200 + success:true = 成功
+- 400 = 冷却期
 """
 
 import os
@@ -20,7 +21,7 @@ from base64 import b64encode, b64decode
 
 BASE_URL = "https://hub.weirdhost.xyz"
 SCREENSHOT_PATH = "debug_result.png"
-MAX_WAIT_API = 30
+MAX_WAIT_API = 15
 
 # ==================== 工具函数 ====================
 
@@ -116,34 +117,29 @@ def send_telegram_photo(photo_path: str, caption: str) -> bool:
         with open(photo_path, "rb") as f:
             photo_data = f.read()
         
-        body = []
-        body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="chat_id"')
-        body.append(b"")
-        body.append(chat_id.encode())
+        body = b"\r\n".join([
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="chat_id"',
+            b"",
+            chat_id.encode(),
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="caption"',
+            b"",
+            caption.encode('utf-8'),
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="parse_mode"',
+            b"",
+            b"HTML",
+            f"--{boundary}".encode(),
+            b'Content-Disposition: form-data; name="photo"; filename="screenshot.png"',
+            b"Content-Type: image/png",
+            b"",
+            photo_data,
+            f"--{boundary}--".encode(),
+            b""
+        ])
         
-        body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="caption"')
-        body.append(b"")
-        body.append(caption.encode('utf-8'))
-        
-        body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="parse_mode"')
-        body.append(b"")
-        body.append(b"HTML")
-        
-        body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="photo"; filename="screenshot.png"')
-        body.append(b"Content-Type: image/png")
-        body.append(b"")
-        body.append(photo_data)
-        
-        body.append(f"--{boundary}--".encode())
-        body.append(b"")
-        
-        body_bytes = b"\r\n".join(body)
-        
-        req = urllib.request.Request(url, data=body_bytes, method="POST")
+        req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         
         urllib.request.urlopen(req, timeout=60)
@@ -224,7 +220,7 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             proxy_arg = f"socks5://{proxy_addr}"
             print(f"[浏览器] 使用 SOCKS5 代理: {proxy_addr}")
         
-        # 启动浏览器 (seleniumbase 自动管理 chromedriver)
+        # 启动浏览器
         print("[浏览器] 启动 Chrome...")
         driver = Driver(
             browser="chrome",
@@ -234,12 +230,14 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         )
         driver.set_page_load_timeout(60)
         
+        # 启用网络监听
+        driver.execute_cdp_cmd("Network.enable", {})
+        
         # 访问主页设置 Cookie
         print(f"[浏览器] 访问 {BASE_URL}")
         driver.get(BASE_URL)
         time.sleep(5)
         
-        # 检查 CF 验证
         if "just a moment" in driver.page_source.lower():
             print("[浏览器] 等待 CF 验证...")
             time.sleep(10)
@@ -256,7 +254,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         driver.get(server_url)
         time.sleep(5)
         
-        # 检查 CF 验证
         if "just a moment" in driver.page_source.lower():
             print("[浏览器] 等待 CF 验证...")
             time.sleep(10)
@@ -272,7 +269,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         # 等待页面加载
         print("[浏览器] 等待页面加载...")
         time.sleep(5)
-        driver.save_screenshot("debug_before.png")
         
         # 滚动页面
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
@@ -284,6 +280,8 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         if expiry_match:
             result["expiry"] = expiry_match.group(1)
             print(f"[浏览器] 到期时间: {result['expiry']}")
+        
+        old_expiry = result["expiry"]
         
         # 查找续期按钮
         print("[浏览器] 查找续期按钮...")
@@ -309,73 +307,119 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             result["screenshot"] = SCREENSHOT_PATH
             return result
         
+        # 注入 XHR 拦截器
+        driver.execute_script("""
+            window._renewResult = null;
+            (function() {
+                const origOpen = XMLHttpRequest.prototype.open;
+                const origSend = XMLHttpRequest.prototype.send;
+                
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this._url = url;
+                    return origOpen.apply(this, arguments);
+                };
+                
+                XMLHttpRequest.prototype.send = function() {
+                    this.addEventListener('load', function() {
+                        if (this._url && this._url.includes('/renew')) {
+                            window._renewResult = {
+                                status: this.status,
+                                response: this.responseText
+                            };
+                            console.log('Renew response:', this.status, this.responseText);
+                        }
+                    });
+                    return origSend.apply(this, arguments);
+                };
+                
+                // 也拦截 fetch
+                const origFetch = window.fetch;
+                window.fetch = function(url, options) {
+                    return origFetch.apply(this, arguments).then(response => {
+                        if (url && url.toString().includes('/renew')) {
+                            response.clone().text().then(text => {
+                                window._renewResult = {
+                                    status: response.status,
+                                    response: text
+                                };
+                                console.log('Renew fetch response:', response.status, text);
+                            });
+                        }
+                        return response;
+                    });
+                };
+            })();
+        """)
+        
         # 点击续期按钮
         print("[浏览器] 点击续期按钮...")
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", renew_button)
         time.sleep(1)
         renew_button.click()
         
-        # 等待结果
-        print("[浏览器] 等待操作结果...")
+        # 等待并检查结果
+        print("[浏览器] 等待 API 响应...")
         
         for i in range(MAX_WAIT_API):
             time.sleep(1)
             
+            # 检查拦截到的响应
             try:
-                current_source = driver.page_source
-                
-                # 检查成功消息
-                if any(kw in current_source for kw in ["성공", "success", "완료", "추가되었"]):
-                    result["success"] = True
-                    print(f"[浏览器] 检测到成功消息 ({i+1}秒)")
-                    break
-                
-                # 检查冷却期消息
-                if any(kw in current_source for kw in ["아직", "기다려", "cooldown", "wait", "시간이 남았"]):
-                    result["is_cooldown"] = True
-                    print(f"[浏览器] 检测到冷却期消息 ({i+1}秒)")
-                    break
-                
-                # 检查新的到期时间
-                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', current_source)
-                if new_match:
-                    new_expiry = new_match.group(1)
-                    if result["expiry"] and new_expiry != result["expiry"]:
-                        result["success"] = True
-                        result["expiry"] = new_expiry
-                        print(f"[浏览器] 到期时间已更新: {new_expiry} ({i+1}秒)")
+                renew_result = driver.execute_script("return window._renewResult;")
+                if renew_result:
+                    status = renew_result.get("status")
+                    response_text = renew_result.get("response", "")
+                    
+                    print(f"[浏览器] API 响应: status={status}")
+                    
+                    if status == 200:
+                        try:
+                            resp_json = json.loads(response_text)
+                            if resp_json.get("success") == True:
+                                result["success"] = True
+                                result["message"] = "续期成功"
+                                print("[浏览器] ✓ API 返回成功")
+                                break
+                        except:
+                            pass
+                    elif status == 400:
+                        result["is_cooldown"] = True
+                        result["message"] = "冷却期内"
+                        print("[浏览器] ⏳ API 返回 400 (冷却期)")
+                        break
+                    else:
+                        result["message"] = f"API 返回 {status}"
+                        print(f"[浏览器] ✗ API 返回 {status}")
                         break
             except:
                 pass
             
-            if i % 5 == 4:
+            if i % 3 == 2:
                 print(f"[浏览器] 等待中... ({i+1}秒)")
         
-        # 保存截图
-        time.sleep(2)
-        driver.save_screenshot(SCREENSHOT_PATH)
-        result["screenshot"] = SCREENSHOT_PATH
-        print("[浏览器] 已保存截图")
-        
-        # 判断结果
-        if result["success"]:
-            result["message"] = "续期成功"
-            print("[浏览器] ✓ 续期成功")
-            
+        # 如果没有拦截到响应，检查到期时间变化
+        if not result["success"] and not result["is_cooldown"]:
+            print("[浏览器] 未拦截到 API 响应，检查到期时间变化...")
+            time.sleep(2)
             driver.refresh()
             time.sleep(3)
+            
             new_source = driver.page_source
             new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_source)
             if new_match:
-                result["expiry"] = new_match.group(1)
-            driver.save_screenshot(SCREENSHOT_PATH)
-            
-        elif result["is_cooldown"]:
-            result["message"] = "冷却期内"
-            print("[浏览器] ⏳ 冷却期内")
-        else:
-            result["message"] = "未检测到结果"
-            print("[浏览器] ✗ 未检测到结果")
+                new_expiry = new_match.group(1)
+                if old_expiry and new_expiry != old_expiry:
+                    result["success"] = True
+                    result["expiry"] = new_expiry
+                    result["message"] = "续期成功（到期时间已更新）"
+                    print(f"[浏览器] ✓ 到期时间已更新: {old_expiry} → {new_expiry}")
+                else:
+                    result["expiry"] = new_expiry
+        
+        # 保存截图
+        driver.save_screenshot(SCREENSHOT_PATH)
+        result["screenshot"] = SCREENSHOT_PATH
+        print("[浏览器] 已保存截图")
         
         # 获取新 Cookie
         try:
@@ -423,7 +467,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v26 (SeleniumBase + SOCKS5)")
+    print("WeirdHost 自动续期 v27 (API 响应检测)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
@@ -444,7 +488,7 @@ def main():
         notify_telegram(msg, screenshot)
         sys.exit(0)
     elif result["is_cooldown"]:
-        print(f"[通知] 冷却期内，跳过通知")
+        print(f"[结果] 冷却期内，跳过通知")
         print(f"[信息] 到期: {result['expiry']}，剩余: {remaining}")
         sys.exit(0)
     elif result["cookie_expired"]:
