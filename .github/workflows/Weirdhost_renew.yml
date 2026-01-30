@@ -1,11 +1,8 @@
 name: WeirdHost 自动续期
 
 on:
-  # 每天 UTC 0:00 和 12:00 运行（北京时间 8:00 和 20:00）
   schedule:
     - cron: '0 0,12 * * *'
-  
-  # 手动触发
   workflow_dispatch:
 
 env:
@@ -27,7 +24,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # 移除 cache: 'pip'
 
       - name: 安装系统依赖
         run: |
