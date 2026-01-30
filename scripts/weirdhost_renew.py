@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WeirdHost 自动续期脚本 v8
+WeirdHost 自动续期脚本 v9
 """
 
 import os
@@ -43,7 +43,6 @@ def encrypt_secret(public_key: str, secret_value: str) -> str:
 # 工具函数
 # ============================================================
 def mask_string(s: str, show: int = 4) -> str:
-    """遮蔽敏感信息，只显示前后几个字符"""
     if not s:
         return "***"
     if len(s) <= show * 2:
@@ -52,7 +51,6 @@ def mask_string(s: str, show: int = 4) -> str:
 
 
 def parse_cookie(cookie_str: str) -> tuple:
-    """解析 Cookie，自动处理 URL 编码"""
     cookie_str = unquote(cookie_str.strip())
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
@@ -175,8 +173,62 @@ async def update_github_secret(secret_name: str, secret_value: str) -> bool:
 
 
 # ============================================================
-# Cloudflare 验证处理
+# 等待页面加载完成
 # ============================================================
+async def wait_for_page_load(page: Page, timeout: int = 60) -> bool:
+    """等待页面完全加载（无 loading 动画）"""
+    print("[页面] 等待加载完成...")
+    
+    for i in range(timeout):
+        try:
+            # 检查是否还有 loading 状态
+            is_loading = await page.evaluate("""
+                () => {
+                    // 检查常见的 loading 指示器
+                    const spinners = document.querySelectorAll(
+                        '.loading, .spinner, [class*="loading"], [class*="spinner"], ' +
+                        'svg[class*="animate"], [class*="animate-spin"]'
+                    );
+                    for (const el of spinners) {
+                        const style = window.getComputedStyle(el);
+                        if (style.display !== 'none' && style.visibility !== 'hidden') {
+                            return true;
+                        }
+                    }
+                    
+                    // 检查页面是否有实际内容（服务器信息）
+                    const text = document.body.innerText || '';
+                    if (text.includes('유통기한') || text.includes('시간추가') || 
+                        text.includes('expir') || text.includes('renew')) {
+                        return false;  // 内容已加载
+                    }
+                    
+                    // 检查是否只有侧边栏没有主内容
+                    const mainContent = document.querySelector('main, [class*="content"], [class*="main"]');
+                    if (mainContent && mainContent.innerText.trim().length < 50) {
+                        return true;  // 主内容还没加载
+                    }
+                    
+                    return false;
+                }
+            """)
+            
+            if not is_loading:
+                print(f"[页面] ✓ 加载完成 ({i+1}s)")
+                return True
+            
+            if i % 10 == 0 and i > 0:
+                print(f"[页面] 加载中... ({i}s)")
+            
+            await page.wait_for_timeout(1000)
+            
+        except Exception as e:
+            await page.wait_for_timeout(1000)
+    
+    print(f"[页面] ⚠ 加载超时 ({timeout}s)")
+    return False
+
+
 async def wait_for_cloudflare(page: Page, timeout: int = 120) -> bool:
     print("[CF] 检测验证状态...")
     for i in range(timeout):
@@ -267,16 +319,15 @@ async def get_expiry_time(page: Page) -> str:
 
 async def scroll_and_find_renew_button(page: Page) -> bool:
     """滚动页面并查找续期按钮"""
-    print("[续期] 滚动页面查找按钮...")
+    print("[续期] 查找续期按钮...")
     
-    # 先尝试直接查找
-    for attempt in range(5):
+    for attempt in range(8):
         # 滚动页面
-        await page.evaluate(f"window.scrollBy(0, {300 * (attempt + 1)})")
-        await page.wait_for_timeout(500)
+        await page.evaluate(f"window.scrollBy(0, {400 * (attempt + 1)})")
+        await page.wait_for_timeout(800)
         
-        # 查找并点击按钮
-        clicked = await page.evaluate("""
+        # 查找按钮
+        found = await page.evaluate("""
             () => {
                 const buttons = document.querySelectorAll('button, a, [role="button"]');
                 const keywords = ['시간추가', '시간연장', '연장', '갱신', 'renew', 'extend', 'add time'];
@@ -284,8 +335,7 @@ async def scroll_and_find_renew_button(page: Page) -> bool:
                     const text = (btn.textContent || btn.innerText || '').toLowerCase();
                     for (const kw of keywords) {
                         if (text.includes(kw.toLowerCase())) {
-                            // 滚动到按钮位置
-                            btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            btn.scrollIntoView({ behavior: 'instant', block: 'center' });
                             return true;
                         }
                     }
@@ -294,10 +344,10 @@ async def scroll_and_find_renew_button(page: Page) -> bool:
             }
         """)
         
-        if clicked:
-            await page.wait_for_timeout(1000)
-            # 再次点击确保触发
-            await page.evaluate("""
+        if found:
+            await page.wait_for_timeout(500)
+            # 点击按钮
+            clicked = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll('button, a, [role="button"]');
                     const keywords = ['시간추가', '시간연장', '연장', '갱신', 'renew', 'extend', 'add time'];
@@ -313,32 +363,10 @@ async def scroll_and_find_renew_button(page: Page) -> bool:
                     return false;
                 }
             """)
-            return True
+            if clicked:
+                return True
     
-    # 尝试滚动到底部
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(1000)
-    
-    # 最后一次尝试
-    clicked = await page.evaluate("""
-        () => {
-            const buttons = document.querySelectorAll('button, a, [role="button"]');
-            const keywords = ['시간추가', '시간연장', '연장', '갱신', 'renew', 'extend', 'add time'];
-            for (const btn of buttons) {
-                const text = (btn.textContent || btn.innerText || '').toLowerCase();
-                for (const kw of keywords) {
-                    if (text.includes(kw.toLowerCase())) {
-                        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        setTimeout(() => btn.click(), 500);
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-    """)
-    
-    return clicked
+    return False
 
 
 async def click_confirm_button(page: Page):
@@ -409,9 +437,16 @@ async def renew_server(page: Page, server_url: str) -> Dict:
     
     try:
         print("[续期] 访问服务器页面...")
-        await page.goto(server_url, timeout=60000)
+        await page.goto(server_url, timeout=60000, wait_until="domcontentloaded")
+        
+        # 等待 Cloudflare 验证
         await wait_for_cloudflare(page, timeout=90)
-        await page.wait_for_timeout(2000)
+        
+        # 等待页面内容加载完成
+        await wait_for_page_load(page, timeout=60)
+        
+        # 额外等待确保动态内容加载
+        await page.wait_for_timeout(3000)
         
         if "/auth/login" in page.url or "/login" in page.url:
             result["message"] = "Cookie 已失效"
@@ -419,14 +454,17 @@ async def renew_server(page: Page, server_url: str) -> Dict:
             await page.screenshot(path="login_required.png")
             return result
         
+        # 获取到期时间
         result["expiry_before"] = await get_expiry_time(page)
         if result["expiry_before"] != "Unknown":
             remaining = calculate_remaining_time(result["expiry_before"])
             print(f"[续期] 当前到期: {result['expiry_before']} ({remaining})")
+        else:
+            print("[续期] 未能获取到期时间，继续尝试...")
         
         await page.screenshot(path="server_page.png")
         
-        # 使用新的滚动查找函数
+        # 查找并点击续期按钮
         if not await scroll_and_find_renew_button(page):
             result["message"] = "未找到续期按钮"
             print(f"[续期] ✗ {result['message']}")
@@ -437,6 +475,7 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         await page.wait_for_timeout(2000)
         await page.screenshot(path="renew_clicked.png")
         
+        # 处理 Turnstile 验证
         await handle_turnstile(page, timeout=60)
         await click_confirm_button(page)
         await page.wait_for_timeout(3000)
@@ -459,7 +498,7 @@ async def renew_server(page: Page, server_url: str) -> Dict:
                 await page.wait_for_timeout(2000)
                 await page.reload()
                 await wait_for_cloudflare(page, timeout=30)
-                await page.wait_for_timeout(2000)
+                await wait_for_page_load(page, timeout=30)
                 result["expiry_after"] = await get_expiry_time(page)
                 if result["expiry_after"] != "Unknown":
                     new_remaining = calculate_remaining_time(result["expiry_after"])
@@ -514,7 +553,7 @@ async def main():
     cookie_name, cookie_value = parse_cookie(cookie_str)
     
     print(f"\n{'=' * 60}")
-    print("WeirdHost 自动续期脚本 v8")
+    print("WeirdHost 自动续期脚本 v9")
     print(f"{'=' * 60}")
     print(f"Cookie: {mask_string(cookie_name)}={mask_string(cookie_value, 8)}")
     print(f"Server: [已隐藏]")
