@@ -2,52 +2,28 @@ name: WeirdHost 自动续期
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'
+    - cron: '0 */8 * * *'
   workflow_dispatch:
-
-env:
-  TZ: Asia/Shanghai
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
+    
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
-      - name: 检查 Secrets
-        run: |
-          echo "检查 WEIRDHOST_COOKIE..."
-          if [ -z "${{ secrets.WEIRDHOST_COOKIE }}" ]; then
-            echo "❌ WEIRDHOST_COOKIE 未设置"
-            exit 1
-          else
-            echo "✓ WEIRDHOST_COOKIE 已设置 (长度: ${#COOKIE})"
-          fi
-          
-          echo "检查 WEIRDHOST_SERVER_URL..."
-          if [ -z "${{ secrets.WEIRDHOST_SERVER_URL }}" ]; then
-            echo "❌ WEIRDHOST_SERVER_URL 未设置"
-            exit 1
-          else
-            echo "✓ WEIRDHOST_SERVER_URL 已设置"
-          fi
-        env:
-          COOKIE: ${{ secrets.WEIRDHOST_COOKIE }}
-
+      
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+      
       - name: 安装依赖
         run: |
-          pip install playwright aiohttp pynacl
-          playwright install chromium
-          playwright install-deps chromium
-
+          pip install seleniumbase pynacl
+          seleniumbase install chromedriver
+      
       - name: 运行续期脚本
         env:
           WEIRDHOST_COOKIE: "${{ secrets.WEIRDHOST_COOKIE }}"
@@ -57,12 +33,12 @@ jobs:
           REPO_TOKEN: "${{ secrets.REPO_TOKEN }}"
           GITHUB_REPOSITORY: "${{ github.repository }}"
         run: python scripts/weirdhost_renew.py
-
+      
       - name: 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ github.run_number }}
+          name: screenshots
           path: "*.png"
           retention-days: 3
           if-no-files-found: ignore
