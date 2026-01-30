@@ -96,14 +96,14 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scripts/weirdhost_renew.py
       
-#      - name: 上传调试截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: debug-screenshots
-#          path: debug_*.png
-#          if-no-files-found: ignore
-#          retention-days: 3
+      - name: 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug_*.png
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: 清理旧运行（保留最近 3 次）
         if: always()
