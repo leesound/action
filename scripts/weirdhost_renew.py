@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v21
+WeirdHost 自动续期 v22
+- 使用 SeleniumBase UC Mode 绕过 Cloudflare Turnstile
 - 监听 API 请求判断结果
-- 等待 CF Turnstile 验证
 """
 
 import os
@@ -12,6 +12,7 @@ import time
 import re
 import urllib.parse
 import urllib.request
+import platform
 from datetime import datetime
 from typing import Optional, Dict
 from base64 import b64encode, b64decode
@@ -19,9 +20,8 @@ from base64 import b64encode, b64decode
 # ==================== 配置 ====================
 
 BASE_URL = "https://hub.weirdhost.xyz"
-PAGE_TIMEOUT = 120000
-RETRY_COUNT = 3
 SCREENSHOT_PATH = "debug_result.png"
+MAX_WAIT_API = 30
 
 # ==================== 工具函数 ====================
 
@@ -42,16 +42,33 @@ def calculate_remaining_time(expiry_str: str) -> str:
         
         days = diff.days
         hours = diff.seconds // 3600
-        
         parts = []
         if days > 0:
             parts.append(f"{days}天")
         if hours > 0:
             parts.append(f"{hours}小时")
-        
         return " ".join(parts) if parts else "不到1小时"
     except:
         return "计算失败"
+
+
+def is_linux() -> bool:
+    return platform.system().lower() == "linux"
+
+
+def setup_linux_display():
+    """Linux 虚拟显示"""
+    if is_linux() and not os.environ.get("DISPLAY"):
+        try:
+            from pyvirtualdisplay import Display
+            display = Display(visible=False, size=(1920, 1080))
+            display.start()
+            os.environ["DISPLAY"] = display.new_display_var
+            print("[Linux] 已启动虚拟显示")
+            return display
+        except Exception as e:
+            print(f"[Linux] 虚拟显示失败: {e}")
+    return None
 
 
 # ==================== GitHub API ====================
@@ -197,7 +214,7 @@ def notify_telegram(message: str, proxy: Optional[str] = None, photo_path: Optio
         print(f"[TG] ✗ 发送失败: {e}")
 
 
-# ==================== 浏览器自动化 ====================
+# ==================== SeleniumBase 自动化 ====================
 
 def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
     cookie_str = urllib.parse.unquote(cookie_str.strip())
@@ -211,7 +228,10 @@ def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
 
 
 def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = None) -> Dict:
-    from playwright.sync_api import sync_playwright
+    from seleniumbase import SB
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
     
     result = {
         "success": False,
@@ -224,115 +244,72 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
     }
     
     cookies = parse_cookie_string(cookie_str)
+    server_url = f"{BASE_URL}/server/{server_id}"
+    api_result = {"status": None, "body": None}
     
-    # 用于存储 API 响应
-    api_response = {"status": None, "body": None}
+    # 设置 Linux 虚拟显示
+    display = setup_linux_display()
     
-    with sync_playwright() as p:
-        browser_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        
-        proxy_config = None
+    try:
+        # 配置代理
+        proxy_arg = None
         if proxy:
             proxy_host = proxy.replace("http://", "").replace("https://", "")
-            proxy_config = {"server": f"http://{proxy_host}"}
+            proxy_arg = proxy_host
             print(f"[浏览器] 使用代理: {proxy_host}")
         
-        browser = p.chromium.launch(headless=True, args=browser_args)
-        
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            proxy=proxy_config
-        )
-        
-        cookie_list = [{"name": k, "value": v, "domain": "hub.weirdhost.xyz", "path": "/"} for k, v in cookies.items()]
-        if cookie_list:
-            context.add_cookies(cookie_list)
-        
-        page = context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT)
-        
-        # 监听 API 响应
-        def handle_response(response):
-            if "/renew" in response.url and "notfreeservers" in response.url:
+        with SB(uc=True, test=True, locale="en", proxy=proxy_arg) as sb:
+            # 先访问域名设置 Cookie
+            print(f"[浏览器] 访问 {BASE_URL}")
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=5)
+            time.sleep(2)
+            
+            # 添加 Cookie
+            for name, value in cookies.items():
                 try:
-                    api_response["status"] = response.status
-                    api_response["body"] = response.json()
-                    print(f"[API] 状态: {response.status}")
-                    print(f"[API] 响应: {api_response['body']}")
+                    sb.add_cookie({"name": name, "value": value, "domain": "hub.weirdhost.xyz"})
                 except:
                     pass
-        
-        page.on("response", handle_response)
-        
-        try:
-            server_url = f"{BASE_URL}/server/{server_id}"
             
-            for attempt in range(RETRY_COUNT):
-                try:
-                    print(f"[浏览器] 访问 {server_url} (尝试 {attempt + 1}/{RETRY_COUNT})")
-                    page.goto(server_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-                    break
-                except Exception as e:
-                    if attempt < RETRY_COUNT - 1:
-                        print(f"[浏览器] 访问失败，重试中...")
-                        time.sleep(5)
-                    else:
-                        raise e
+            # 访问服务器页面
+            print(f"[浏览器] 访问 {server_url}")
+            sb.uc_open_with_reconnect(server_url, reconnect_time=5)
+            time.sleep(3)
             
+            # 检查是否需要登录
+            if "/login" in sb.get_current_url():
+                result["cookie_expired"] = True
+                result["message"] = "Cookie 已失效"
+                sb.save_screenshot(SCREENSHOT_PATH)
+                result["screenshot"] = SCREENSHOT_PATH
+                return result
+            
+            # 等待页面加载
             print("[浏览器] 等待页面加载...")
             time.sleep(5)
             
-            if "/login" in page.url:
-                result["cookie_expired"] = True
-                result["message"] = "Cookie 已失效"
-                page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-                result["screenshot"] = SCREENSHOT_PATH
-                browser.close()
-                return result
-            
             # 滚动到底部
-            print("[浏览器] 滚动页面...")
-            for _ in range(5):
-                page.evaluate("window.scrollBy(0, 500)")
-                time.sleep(0.5)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(2)
             
             # 获取到期时间
-            page_content = page.content()
-            expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_content)
+            page_source = sb.get_page_source()
+            expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_source)
             if expiry_match:
                 result["expiry"] = expiry_match.group(1)
                 print(f"[浏览器] 到期时间: {result['expiry']}")
             
             # 查找续期按钮
+            print("[浏览器] 查找续期按钮...")
             renew_button = None
-            selectors = [
-                "button:has-text('시간추가')",
-                "span:has-text('시간추가')",
-            ]
             
-            for selector in selectors:
-                try:
-                    elem = page.query_selector(selector)
-                    if elem and elem.is_visible():
-                        tag = elem.evaluate("el => el.tagName.toLowerCase()")
-                        if tag == "span":
-                            renew_button = elem.evaluate_handle("el => el.closest('button')")
-                        else:
-                            renew_button = elem
-                        print(f"[浏览器] 找到按钮: {selector}")
-                        break
-                except:
-                    continue
-            
-            if not renew_button:
-                buttons = page.query_selector_all("button")
+            try:
+                buttons = sb.find_elements("button")
                 for btn in buttons:
                     try:
-                        text = btn.inner_text().strip()
-                        if "Delete" in text or "red" in (btn.get_attribute("class") or ""):
+                        text = btn.text.strip()
+                        class_attr = btn.get_attribute("class") or ""
+                        if "Delete" in text or "red" in class_attr.lower():
                             continue
                         if "시간추가" in text:
                             renew_button = btn
@@ -340,83 +317,113 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
                             break
                     except:
                         continue
+            except Exception as e:
+                print(f"[浏览器] 查找按钮失败: {e}")
             
             if not renew_button:
                 result["message"] = "未找到续期按钮"
-                page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+                sb.save_screenshot(SCREENSHOT_PATH)
                 result["screenshot"] = SCREENSHOT_PATH
-                browser.close()
                 return result
             
-            # 点击按钮
+            # 启用网络监听 (通过 CDP)
+            print("[浏览器] 启用网络监听...")
+            try:
+                sb.execute_cdp_cmd("Network.enable", {})
+            except:
+                pass
+            
+            # 点击续期按钮
             print("[浏览器] 点击续期按钮...")
-            renew_button.scroll_into_view_if_needed()
+            sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", renew_button)
             time.sleep(1)
             renew_button.click()
             
-            # 等待 CF Turnstile 验证和 API 响应
+            # 等待 Cloudflare Turnstile 验证
             print("[浏览器] 等待 Cloudflare 验证...")
-            max_wait = 60  # 最多等待60秒
-            for i in range(max_wait):
+            cf_handled = False
+            
+            for i in range(MAX_WAIT_API):
                 time.sleep(1)
-                if api_response["status"] is not None:
-                    print(f"[浏览器] API 响应已收到 ({i+1}秒)")
-                    break
-                if i % 10 == 9:
+                
+                # 检测 Turnstile iframe
+                if not cf_handled:
+                    try:
+                        page_src = sb.get_page_source().lower()
+                        if "turnstile" in page_src or "challenges.cloudflare" in page_src:
+                            print("[浏览器] 检测到 Turnstile，尝试处理...")
+                            try:
+                                sb.uc_gui_click_captcha()
+                                cf_handled = True
+                                print("[浏览器] ✓ Turnstile 已处理")
+                            except Exception as e:
+                                print(f"[浏览器] Turnstile 处理失败: {e}")
+                    except:
+                        pass
+                
+                # 检查页面变化（API 响应后页面会更新）
+                try:
+                    current_source = sb.get_page_source()
+                    
+                    # 检查成功消息
+                    if any(kw in current_source for kw in ["성공", "success", "완료", "추가되었"]):
+                        api_result["status"] = 200
+                        print(f"[浏览器] 检测到成功消息 ({i+1}秒)")
+                        break
+                    
+                    # 检查冷却期消息
+                    if any(kw in current_source for kw in ["아직", "기다려", "cooldown", "wait"]):
+                        api_result["status"] = 400
+                        print(f"[浏览器] 检测到冷却期消息 ({i+1}秒)")
+                        break
+                    
+                    # 检查新的到期时间
+                    new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', current_source)
+                    if new_match:
+                        new_expiry = new_match.group(1)
+                        if result["expiry"] and new_expiry != result["expiry"]:
+                            api_result["status"] = 200
+                            result["expiry"] = new_expiry
+                            print(f"[浏览器] 到期时间已更新: {new_expiry} ({i+1}秒)")
+                            break
+                except:
+                    pass
+                
+                if i % 5 == 4:
                     print(f"[浏览器] 等待中... ({i+1}秒)")
             
             # 保存截图
             time.sleep(2)
-            page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+            sb.save_screenshot(SCREENSHOT_PATH)
             result["screenshot"] = SCREENSHOT_PATH
-            print("[浏览器] 已保存结果截图")
+            print("[浏览器] 已保存截图")
             
-            # 根据 API 响应判断结果
-            if api_response["status"] == 200:
-                body = api_response["body"] or {}
-                if body.get("success") == True:
-                    result["success"] = True
-                    result["message"] = "续期成功"
-                    print("[浏览器] ✓ 续期成功 (API 确认)")
-                else:
-                    result["success"] = True
-                    result["message"] = "续期成功"
-                    print("[浏览器] ✓ 续期成功 (状态码 200)")
-            elif api_response["status"] == 400:
-                result["is_cooldown"] = True
-                body = api_response["body"] or {}
-                errors = body.get("errors", [])
-                if errors:
-                    detail = errors[0].get("detail", "冷却期内")
-                    result["message"] = detail
-                else:
-                    result["message"] = "冷却期内"
-                print(f"[浏览器] ⏳ 冷却期: {result['message']}")
-            elif api_response["status"] is None:
-                # 没有收到 API 响应，可能 CF 验证失败
-                result["message"] = "未收到 API 响应，可能 CF 验证失败"
-                print("[浏览器] ✗ 未收到 API 响应")
-            else:
-                result["message"] = f"API 返回状态码: {api_response['status']}"
-                print(f"[浏览器] ✗ API 错误: {api_response['status']}")
-            
-            # 刷新获取新的到期时间
-            if result["success"]:
-                print("[浏览器] 刷新页面获取新到期时间...")
-                page.reload(wait_until="domcontentloaded")
+            # 判断结果
+            if api_result["status"] == 200:
+                result["success"] = True
+                result["message"] = "续期成功"
+                print("[浏览器] ✓ 续期成功")
+                
+                # 刷新获取最新到期时间
+                sb.refresh()
                 time.sleep(3)
-                new_content = page.content()
-                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_content)
+                new_source = sb.get_page_source()
+                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_source)
                 if new_match:
                     result["expiry"] = new_match.group(1)
-                    print(f"[浏览器] 新到期时间: {result['expiry']}")
+                sb.save_screenshot(SCREENSHOT_PATH)
                 
-                # 再次截图
-                page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+            elif api_result["status"] == 400:
+                result["is_cooldown"] = True
+                result["message"] = "冷却期内"
+                print("[浏览器] ⏳ 冷却期内")
+            else:
+                result["message"] = "未检测到 API 响应，可能 CF 验证失败"
+                print("[浏览器] ✗ 未检测到结果")
             
             # 获取新 Cookie
             try:
-                for cookie in context.cookies():
+                for cookie in sb.get_cookies():
                     if cookie["name"].startswith("remember_web"):
                         new_cookie_str = f"{cookie['name']}={cookie['value']}"
                         if new_cookie_str != cookie_str:
@@ -425,17 +432,21 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
             except:
                 pass
             
-        except Exception as e:
-            result["message"] = str(e)
-            print(f"[浏览器] ✗ 异常: {e}")
+    except Exception as e:
+        result["message"] = str(e)
+        print(f"[浏览器] ✗ 异常: {e}")
+        try:
+            import traceback
+            traceback.print_exc()
+        except:
+            pass
+    
+    finally:
+        if display:
             try:
-                page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-                result["screenshot"] = SCREENSHOT_PATH
+                display.stop()
             except:
                 pass
-        
-        finally:
-            browser.close()
     
     return result
 
@@ -452,7 +463,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v21")
+    print("WeirdHost 自动续期 v22 (SeleniumBase UC)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"代理: {proxy if proxy else '无'}")
@@ -474,7 +485,6 @@ def main():
         notify_telegram(msg, proxy, screenshot)
         sys.exit(0)
     elif result["is_cooldown"]:
-        # 冷却期不发送通知
         print(f"[通知] 冷却期内，跳过通知")
         print(f"[信息] 到期: {result['expiry']}，剩余: {remaining}")
         sys.exit(0)
