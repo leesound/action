@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v25
-- 使用 undetected-chromedriver
+WeirdHost 自动续期 v26
+- 使用 seleniumbase (自动管理 chromedriver)
 - 浏览器走 SOCKS5 代理
 """
 
@@ -125,7 +125,7 @@ def send_telegram_photo(photo_path: str, caption: str) -> bool:
         body.append(f"--{boundary}".encode())
         body.append(b'Content-Disposition: form-data; name="caption"')
         body.append(b"")
-        body.append(caption.encode())
+        body.append(caption.encode('utf-8'))
         
         body.append(f"--{boundary}".encode())
         body.append(b'Content-Disposition: form-data; name="parse_mode"')
@@ -154,29 +154,36 @@ def send_telegram_photo(photo_path: str, caption: str) -> bool:
         return False
 
 
+def send_telegram_text(message: str) -> bool:
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = json.dumps({
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        
+        urllib.request.urlopen(req, timeout=30)
+        print("[TG] ✓ 文本通知已发送")
+        return True
+    except Exception as e:
+        print(f"[TG] ✗ 发送失败: {e}")
+        return False
+
+
 def notify_telegram(message: str, photo_path: Optional[str] = None):
     if photo_path and os.path.exists(photo_path):
         if send_telegram_photo(photo_path, message):
             return
-    
-    token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        return
-    
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }).encode()
-        
-        req = urllib.request.Request(url, data=data)
-        urllib.request.urlopen(req, timeout=30)
-        print("[TG] ✓ 文本通知已发送")
-    except Exception as e:
-        print(f"[TG] ✗ 发送失败: {e}")
+    send_telegram_text(message)
 
 
 # ==================== 浏览器自动化 ====================
@@ -193,8 +200,7 @@ def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
 
 
 def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str] = None) -> Dict:
-    import undetected_chromedriver as uc
-    from selenium.webdriver.common.by import By
+    from seleniumbase import Driver
     
     result = {
         "success": False,
@@ -211,23 +217,21 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
     
     driver = None
     try:
-        # 配置 Chrome 选项
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--lang=en-US")
-        
-        # 配置 SOCKS5 代理
+        # 构建代理参数
+        proxy_arg = None
         if socks_proxy:
             proxy_addr = socks_proxy.replace("socks5://", "").replace("socks5h://", "")
-            options.add_argument(f"--proxy-server=socks5://{proxy_addr}")
+            proxy_arg = f"socks5://{proxy_addr}"
             print(f"[浏览器] 使用 SOCKS5 代理: {proxy_addr}")
         
-        # 启动浏览器
+        # 启动浏览器 (seleniumbase 自动管理 chromedriver)
         print("[浏览器] 启动 Chrome...")
-        driver = uc.Chrome(options=options, headless=True, version_main=None)
+        driver = Driver(
+            browser="chrome",
+            headless=True,
+            uc=True,
+            proxy=proxy_arg,
+        )
         driver.set_page_load_timeout(60)
         
         # 访问主页设置 Cookie
@@ -285,7 +289,7 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         print("[浏览器] 查找续期按钮...")
         renew_button = None
         
-        buttons = driver.find_elements(By.TAG_NAME, "button")
+        buttons = driver.find_elements("tag name", "button")
         for btn in buttons:
             try:
                 text = btn.text.strip()
@@ -419,7 +423,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v25 (UC + SOCKS5)")
+    print("WeirdHost 自动续期 v26 (SeleniumBase + SOCKS5)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
