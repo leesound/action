@@ -1,6 +1,3 @@
-明白了！截图显示是 **reCAPTCHA v2 图片验证**（选择汽车），这个无法自动绑过。最好的方案是使用 **Cookie 登录**，跳过登录流程。
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -34,7 +31,7 @@ PROXY_SOCKS_PORT = 1080
 SCREENSHOT_DIR = "."
 
 # Cookie 名称
-REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
+REMEMBER_COOKIE_NAME = "remember_web_65***********14d"
 
 
 # ============================================================
