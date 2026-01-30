@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v15
+WeirdHost 自动续期 v16
+- 支持自动更新 Cookie 到 GitHub Secrets
 """
 
 import os
@@ -13,6 +14,7 @@ import ssl
 from datetime import datetime
 from typing import Optional, Dict, Any
 from urllib.error import HTTPError, URLError
+from base64 import b64encode, b64decode
 
 # ==================== 配置 ====================
 
@@ -22,11 +24,24 @@ API_BASE = f"{BASE_URL}/api/client"
 # ==================== 工具函数 ====================
 
 def parse_cookie(cookie_str: str) -> tuple:
+    """解析 Cookie 字符串"""
     cookie_str = urllib.parse.unquote(cookie_str.strip())
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
         return (parts[0].strip(), parts[1].strip())
     return ("remember_web", cookie_str.strip())
+
+
+def format_cookie(cookie_str: str) -> str:
+    """格式化 Cookie 为完整格式"""
+    cookie_str = cookie_str.strip()
+    # 已经是完整格式
+    if cookie_str.startswith("remember_web_"):
+        return cookie_str
+    # 只有值，添加默认名称
+    if "=" not in cookie_str:
+        return f"remember_web={cookie_str}"
+    return cookie_str
 
 
 def calculate_remaining_time(expiry_str: str) -> str:
@@ -62,9 +77,11 @@ def calculate_remaining_time(expiry_str: str) -> str:
 
 class APIClient:
     def __init__(self, cookie_str: str, proxy: Optional[str] = None):
+        self.cookie_str = format_cookie(cookie_str)
         self.cookie_name, self.cookie_value = parse_cookie(cookie_str)
         self.proxy = proxy
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        self.new_cookie = None  # 存储响应中的新 Cookie
         
         self.ssl_context = ssl.create_default_context()
         self.ssl_context.check_hostname = False
@@ -81,10 +98,24 @@ class APIClient:
             "User-Agent": self.user_agent,
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Cookie": f"{self.cookie_name}={self.cookie_value}",
+            "Cookie": self.cookie_str,
             "Origin": BASE_URL,
             "Referer": f"{BASE_URL}/",
         }
+    
+    def _extract_cookie(self, resp) -> Optional[str]:
+        """从响应头提取新 Cookie"""
+        try:
+            set_cookie = resp.getheader("Set-Cookie", "")
+            if set_cookie and "remember_web" in set_cookie:
+                # 提取 remember_web_xxx=yyy 部分
+                for part in set_cookie.split(";"):
+                    part = part.strip()
+                    if part.startswith("remember_web"):
+                        return part
+        except:
+            pass
+        return None
     
     def request(self, method: str, url: str, data: Any = None, timeout: int = 30) -> Dict:
         result = {"success": False, "status": 0, "data": None, "error": None}
@@ -97,6 +128,12 @@ class APIClient:
             
             with self.opener.open(req, timeout=timeout) as resp:
                 result["status"] = resp.status
+                
+                # 检查是否有新 Cookie
+                new_cookie = self._extract_cookie(resp)
+                if new_cookie:
+                    self.new_cookie = new_cookie
+                
                 body = resp.read().decode('utf-8')
                 try:
                     result["data"] = json.loads(body)
@@ -133,15 +170,17 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     
     if not token or not repo:
-        print("[GitHub] 未配置 REPO_TOKEN 或 GITHUB_REPOSITORY")
+        print("[GitHub] 未配置 REPO_TOKEN 或 GITHUB_REPOSITORY，跳过更新")
         return False
     
     try:
         # 获取公钥
+        print(f"[GitHub] 获取仓库 {repo} 的公钥...")
         key_url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
         req = urllib.request.Request(key_url)
         req.add_header("Authorization", f"token {token}")
         req.add_header("Accept", "application/vnd.github.v3+json")
+        req.add_header("User-Agent", "WeirdHost-Renew-Script")
         
         with urllib.request.urlopen(req, timeout=30) as resp:
             key_data = json.loads(resp.read().decode('utf-8'))
@@ -150,7 +189,6 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         key_id = key_data["key_id"]
         
         # 加密 secret
-        from base64 import b64encode, b64decode
         try:
             from nacl import encoding, public
             
@@ -159,10 +197,12 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
             encrypted = sealed_box.encrypt(secret_value.encode('utf-8'))
             encrypted_value = b64encode(encrypted).decode('utf-8')
         except ImportError:
-            print("[GitHub] 需要 PyNaCl 库来加密 Secret")
+            print("[GitHub] ⚠ 需要 PyNaCl 库来加密 Secret")
+            print("[GitHub] 请运行: pip install pynacl")
             return False
         
         # 更新 secret
+        print(f"[GitHub] 更新 Secret: {secret_name}...")
         secret_url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
         data = json.dumps({
             "encrypted_value": encrypted_value,
@@ -173,6 +213,7 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         req.add_header("Authorization", f"token {token}")
         req.add_header("Accept", "application/vnd.github.v3+json")
         req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "WeirdHost-Renew-Script")
         
         with urllib.request.urlopen(req, timeout=30) as resp:
             if resp.status in (201, 204):
@@ -181,6 +222,9 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         
         return False
         
+    except HTTPError as e:
+        print(f"[GitHub] ✗ HTTP 错误 {e.code}: {e.reason}")
+        return False
     except Exception as e:
         print(f"[GitHub] ✗ 更新失败: {e}")
         return False
@@ -234,7 +278,7 @@ def get_server_info(client: APIClient, server_id: str) -> Dict:
             "data": server
         }
     
-    return {"success": False, "error": resp.get("error", "无法获取")}
+    return {"success": False, "error": resp.get("error", "无法获取"), "status": resp.get("status", 0)}
 
 
 def renew_server(client: APIClient, server_id: str) -> Dict:
@@ -243,7 +287,7 @@ def renew_server(client: APIClient, server_id: str) -> Dict:
     url = f"{API_BASE}/notfreeservers/{server_id}/renew"
     resp = client.post(url, data={})
     
-    result = {"success": False, "is_cooldown": False, "message": ""}
+    result = {"success": False, "is_cooldown": False, "message": "", "cookie_expired": False}
     
     if resp["success"]:
         result["success"] = True
@@ -266,6 +310,7 @@ def renew_server(client: APIClient, server_id: str) -> Dict:
         
     elif resp["status"] in (401, 403):
         result["message"] = "Cookie 已失效"
+        result["cookie_expired"] = True
         print(f"[API] ✗ {result['message']}")
         
     elif resp["status"] == 404:
@@ -297,7 +342,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v15")
+    print("WeirdHost 自动续期 v16")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"代理: {proxy if proxy else '无'}")
@@ -306,7 +351,7 @@ def main():
     
     client = APIClient(cookie, proxy if proxy else None)
     
-    result = {"success": False, "message": "", "expiry": "", "is_cooldown": False}
+    result = {"success": False, "message": "", "expiry": "", "is_cooldown": False, "cookie_expired": False}
     
     try:
         # 获取服务器信息
@@ -316,21 +361,32 @@ def main():
             if result["expiry"]:
                 remaining = calculate_remaining_time(result["expiry"])
                 print(f"[服务器] 到期: {result['expiry']} ({remaining})")
+        elif info.get("status") in (401, 403):
+            result["cookie_expired"] = True
+            result["message"] = "Cookie 已失效"
         
-        # 续期
-        renew = renew_server(client, server_id)
-        result["success"] = renew["success"]
-        result["is_cooldown"] = renew["is_cooldown"]
-        result["message"] = renew["message"]
+        # 如果 Cookie 有效，尝试续期
+        if not result["cookie_expired"]:
+            renew = renew_server(client, server_id)
+            result["success"] = renew["success"]
+            result["is_cooldown"] = renew["is_cooldown"]
+            result["message"] = renew["message"]
+            result["cookie_expired"] = renew.get("cookie_expired", False)
+            
+            # 获取新到期时间
+            if renew["success"]:
+                time.sleep(2)
+                new_info = get_server_info(client, server_id)
+                if new_info.get("success") and new_info.get("expiry"):
+                    result["expiry"] = new_info["expiry"]
+                    remaining = calculate_remaining_time(result["expiry"])
+                    print(f"[续期] 新到期: {result['expiry']} ({remaining})")
         
-        # 获取新到期时间
-        if renew["success"]:
-            time.sleep(2)
-            new_info = get_server_info(client, server_id)
-            if new_info.get("success") and new_info.get("expiry"):
-                result["expiry"] = new_info["expiry"]
-                remaining = calculate_remaining_time(result["expiry"])
-                print(f"[续期] 新到期: {result['expiry']} ({remaining})")
+        # 检查是否有新 Cookie 需要更新
+        if client.new_cookie and client.new_cookie != cookie:
+            print("[Cookie] 检测到新 Cookie，尝试更新...")
+            if update_github_secret("WEIRDHOST_COOKIE", client.new_cookie):
+                notify_telegram("🔄 <b>Cookie 已自动更新</b>\n\nGitHub Secret 已更新为新 Cookie", proxy)
     
     except Exception as e:
         print(f"[异常] {e}")
@@ -347,6 +403,10 @@ def main():
         msg = f"ℹ️ <b>WeirdHost 冷却期</b>\n\n📅 到期: {result['expiry']}\n⏳ 剩余: {remaining}"
         notify_telegram(msg, proxy)
         sys.exit(0)
+    elif result["cookie_expired"]:
+        msg = "❌ <b>WeirdHost Cookie 已失效</b>\n\n请手动更新 WEIRDHOST_COOKIE Secret"
+        notify_telegram(msg, proxy)
+        sys.exit(1)
     else:
         notify_telegram(f"❌ <b>WeirdHost 续期失败</b>\n\n❗ {result['message']}", proxy)
         sys.exit(1)
