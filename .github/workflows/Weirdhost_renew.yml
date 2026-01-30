@@ -56,10 +56,7 @@ jobs:
           TG_CHAT_ID: "${{ secrets.TG_CHAT_ID }}"
           REPO_TOKEN: "${{ secrets.REPO_TOKEN }}"
           GITHUB_REPOSITORY: "${{ github.repository }}"
-        run: |
-          echo "WEIRDHOST_COOKIE 长度: ${#WEIRDHOST_COOKIE}"
-          echo "WEIRDHOST_SERVER_URL: $WEIRDHOST_SERVER_URL"
-          python scripts/weirdhost_renew.py
+        run: python scripts/weirdhost_renew.py
 
       - name: 上传截图
         if: always()
