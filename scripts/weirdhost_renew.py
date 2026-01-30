@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期
+WeirdHost 自动续期 - SeleniumBase UC Mode + 虚拟显示
 """
 
 import os
 import sys
 import time
 import base64
+import platform
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -17,6 +18,32 @@ from typing import Optional
 
 BASE_URL = "https://hub.weirdhost.xyz"
 COOKIE_DOMAIN = "hub.weirdhost.xyz"
+
+# ==================== 虚拟显示设置 ====================
+
+def is_linux() -> bool:
+    return platform.system().lower() == "linux"
+
+
+def setup_display():
+    """设置 Linux 虚拟显示"""
+    if is_linux() and not os.environ.get("DISPLAY"):
+        try:
+            from pyvirtualdisplay import Display
+            display = Display(visible=False, size=(1920, 1080))
+            display.start()
+            os.environ["DISPLAY"] = display.new_display_var
+            print("[显示] ✓ 已启动虚拟显示 (Xvfb)")
+            return display
+        except ImportError:
+            print("[显示] ✗ 请安装: pip install pyvirtualdisplay")
+            print("[显示] ✗ 以及: apt-get install -y xvfb")
+            return None
+        except Exception as e:
+            print(f"[显示] ✗ 启动失败: {e}")
+            return None
+    return None
+
 
 # ==================== 工具函数 ====================
 
@@ -144,6 +171,7 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         return False
     
     try:
+        import json
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {repo_token}",
@@ -151,20 +179,16 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
             "User-Agent": "Python"
         }
         
-        # 获取公钥
         pk_url = f"https://api.github.com/repos/{repository}/actions/secrets/public-key"
         req = urllib.request.Request(pk_url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            import json
             pk_data = json.loads(resp.read().decode())
         
-        # 加密
         pk = public.PublicKey(pk_data["key"].encode("utf-8"), encoding.Base64Encoder())
         sealed_box = public.SealedBox(pk)
         encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
         encrypted_value = base64.b64encode(encrypted).decode("utf-8")
         
-        # 更新
         secret_url = f"https://api.github.com/repos/{repository}/actions/secrets/{secret_name}"
         payload = json.dumps({
             "encrypted_value": encrypted_value,
@@ -188,29 +212,25 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
 # ==================== 页面操作 ====================
 
 def wait_for_cloudflare(sb, timeout: int = 60) -> bool:
-    """等待 Cloudflare 验证通过"""
     print("[CF] 检测验证状态...")
     
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            page_source = sb.get_page_source().lower()
+            page_source = sb.get_page_source()
             current_url = sb.get_current_url().lower()
             
-            # 检查是否已通过验证
-            if any([
-                "유통기한" in sb.get_page_source(),  # 韩文到期时间
-                "시간추가" in sb.get_page_source(),  # 韩文续期按钮
-                "/server/" in current_url,
-                "dashboard" in current_url,
-            ]):
+            if "유통기한" in page_source or "시간추가" in page_source:
                 print(f"[CF] ✓ 验证通过 ({int(time.time() - start_time)}s)")
                 return True
             
-            # 检查是否有 CF 验证页面
-            if "just a moment" in page_source or "checking" in page_source:
-                if int(time.time() - start_time) % 10 == 0:
-                    print(f"[CF] 等待中... ({int(time.time() - start_time)}s)")
+            if "/server/" in current_url:
+                print(f"[CF] ✓ 验证通过 ({int(time.time() - start_time)}s)")
+                return True
+            
+            elapsed = int(time.time() - start_time)
+            if elapsed % 10 == 0 and elapsed > 0:
+                print(f"[CF] 等待中... ({elapsed}s)")
             
             time.sleep(1)
         except:
@@ -221,7 +241,6 @@ def wait_for_cloudflare(sb, timeout: int = 60) -> bool:
 
 
 def wait_for_page_load(sb, timeout: int = 60) -> bool:
-    """等待页面内容加载"""
     print("[页面] 等待加载...")
     
     start_time = time.time()
@@ -232,8 +251,9 @@ def wait_for_page_load(sb, timeout: int = 60) -> bool:
                 print(f"[页面] ✓ 加载完成 ({int(time.time() - start_time)}s)")
                 return True
             
-            if int(time.time() - start_time) % 10 == 0 and int(time.time() - start_time) > 0:
-                print(f"[页面] 加载中... ({int(time.time() - start_time)}s)")
+            elapsed = int(time.time() - start_time)
+            if elapsed % 10 == 0 and elapsed > 0:
+                print(f"[页面] 加载中... ({elapsed}s)")
             
             time.sleep(1)
         except:
@@ -244,7 +264,6 @@ def wait_for_page_load(sb, timeout: int = 60) -> bool:
 
 
 def get_expiry_time(sb) -> str:
-    """获取到期时间"""
     try:
         return sb.execute_script("""
             const text = document.body.innerText;
@@ -256,7 +275,6 @@ def get_expiry_time(sb) -> str:
 
 
 def check_turnstile_completed(sb) -> bool:
-    """检查 Turnstile 是否完成"""
     try:
         result = sb.execute_script("""
             const input = document.querySelector('input[name="cf-turnstile-response"]');
@@ -272,7 +290,7 @@ def wait_for_turnstile(sb, timeout: int = 90) -> bool:
     print("[Turnstile] 等待验证...")
     
     start_time = time.time()
-    clicked = False
+    click_attempted = False
     
     while time.time() - start_time < timeout:
         # 检查是否已完成
@@ -281,21 +299,36 @@ def wait_for_turnstile(sb, timeout: int = 90) -> bool:
             return True
         
         # 尝试点击验证框
-        if not clicked:
+        if not click_attempted:
             try:
-                # 使用 SeleniumBase 的 UC 模式点击验证码
                 sb.uc_gui_click_captcha()
-                clicked = True
-                print("[Turnstile] 已尝试点击验证框")
+                click_attempted = True
+                print("[Turnstile] 已点击验证框")
                 time.sleep(3)
             except Exception as e:
-                print(f"[Turnstile] 点击失败: {e}")
-                clicked = True  # 避免重复尝试
+                print(f"[Turnstile] 点击方式1失败: {e}")
+                # 尝试备用方法
+                try:
+                    # 使用 JavaScript 模拟点击
+                    sb.execute_script("""
+                        const iframe = document.querySelector('iframe[src*="challenges"]');
+                        if (iframe) {
+                            iframe.click();
+                        }
+                        const turnstile = document.querySelector('.cf-turnstile');
+                        if (turnstile) {
+                            turnstile.click();
+                        }
+                    """)
+                    print("[Turnstile] 尝试 JS 点击")
+                except:
+                    pass
+                click_attempted = True
         
+        # 每15秒再次尝试点击
         elapsed = int(time.time() - start_time)
-        if elapsed % 15 == 0 and elapsed > 0:
+        if elapsed > 0 and elapsed % 15 == 0:
             print(f"[Turnstile] 等待中... ({elapsed}s)")
-            # 再次尝试点击
             try:
                 sb.uc_gui_click_captcha()
             except:
@@ -303,7 +336,7 @@ def wait_for_turnstile(sb, timeout: int = 90) -> bool:
         
         time.sleep(1)
     
-    # 最后检查一次
+    # 最后检查
     if check_turnstile_completed(sb):
         print("[Turnstile] ✓ 验证完成")
         return True
@@ -313,10 +346,8 @@ def wait_for_turnstile(sb, timeout: int = 90) -> bool:
 
 
 def click_renew_button(sb) -> bool:
-    """点击续期按钮"""
     print("[续期] 查找续期按钮...")
     
-    # 滚动页面查找按钮
     for scroll in range(5):
         sb.execute_script(f"window.scrollBy(0, {400 * (scroll + 1)})")
         time.sleep(0.5)
@@ -343,7 +374,6 @@ def click_renew_button(sb) -> bool:
 
 
 def click_confirm_button(sb):
-    """点击确认按钮"""
     try:
         sb.execute_script("""
             const buttons = document.querySelectorAll('button');
@@ -360,20 +390,15 @@ def click_confirm_button(sb):
 
 
 def check_renew_result(sb, original_expiry: str) -> dict:
-    """检查续订结果"""
     try:
         time.sleep(2)
-        
-        # 检查页面是否有错误信息
         page_text = sb.get_page_source()
         
-        # 检查是否有冷却期错误
         cooldown_keywords = ["can only once", "can't renew", "cannot renew", "already", "아직"]
         for kw in cooldown_keywords:
             if kw.lower() in page_text.lower():
                 return {"success": False, "is_cooldown": True, "message": "冷却期内"}
         
-        # 获取新的到期时间
         new_expiry = get_expiry_time(sb)
         
         if new_expiry and new_expiry != original_expiry:
@@ -403,12 +428,16 @@ def main():
     cookie_name, cookie_value = parse_cookie(cookie_str)
     
     print("=" * 60)
-    print("WeirdHost 自动续期 v11 (SeleniumBase)")
+    print("WeirdHost 自动续期 v12 (SeleniumBase + Xvfb)")
     print("=" * 60)
+    print(f"系统: {platform.system()} {platform.release()}")
     print(f"Cookie: {mask_string(cookie_name)}={mask_string(cookie_value, 8)}")
     print(f"Server: [已隐藏]")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
+    
+    # 设置虚拟显示（Linux）
+    display = setup_display()
     
     result = {
         "success": False,
@@ -421,11 +450,12 @@ def main():
     try:
         from seleniumbase import SB
         
+        # 使用非 headless 模式（配合虚拟显示）
         sb_kwargs = {
             "uc": True,
             "test": True,
             "locale": "en",
-            "headless": True,  # GitHub Actions 需要 headless
+            "headless": False,  # 非 headless，使用虚拟显示
             "uc_cdp_events": True,
         }
         
@@ -539,9 +569,10 @@ def main():
             except Exception as e:
                 print(f"[Cookie] 检查失败: {e}")
     
-    except ImportError:
-        print("[ERROR] 请安装: pip install seleniumbase")
-        notify_telegram("❌ <b>WeirdHost 续期失败</b>\n\n缺少 seleniumbase 库")
+    except ImportError as e:
+        print(f"[ERROR] 缺少依赖: {e}")
+        print("[ERROR] 请安装: pip install seleniumbase pyvirtualdisplay")
+        notify_telegram("❌ <b>WeirdHost 续期失败</b>\n\n缺少依赖库")
         sys.exit(1)
     except Exception as e:
         print(f"\n[异常] {e}")
@@ -549,6 +580,14 @@ def main():
         traceback.print_exc()
         if not result["message"]:
             result["message"] = str(e)
+    finally:
+        # 清理虚拟显示
+        if display:
+            try:
+                display.stop()
+                print("[显示] 已关闭虚拟显示")
+            except:
+                pass
     
     # 发送通知
     if result["success"]:
