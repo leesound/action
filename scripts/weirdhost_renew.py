@@ -11,7 +11,8 @@ import asyncio
 import aiohttp
 import base64
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict
+from urllib.parse import unquote
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 # ============================================================
@@ -49,7 +50,8 @@ def mask_string(s: str, show: int = 4) -> str:
 
 
 def parse_cookie(cookie_str: str) -> tuple:
-    """解析 name=value 格式的 Cookie"""
+    """解析 name=value 格式的 Cookie，自动处理 URL 编码"""
+    cookie_str = unquote(cookie_str.strip())
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
         return (parts[0].strip(), parts[1].strip())
@@ -89,10 +91,8 @@ def calculate_remaining_time(expiry_str: str) -> str:
 
 
 def is_cooldown_error(error_text: str) -> bool:
-    keywords = [
-        "can only once", "can't renew", "cannot renew", 
-        "already renewed", "too early", "wait", "아직"
-    ]
+    keywords = ["can only once", "can't renew", "cannot renew", 
+                "already renewed", "too early", "wait", "아직"]
     return any(kw in error_text.lower() for kw in keywords)
 
 
@@ -104,7 +104,6 @@ async def tg_notify(message: str):
     chat_id = os.environ.get("TG_CHAT_ID", "").strip()
     if not token or not chat_id:
         return
-    
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(
@@ -122,7 +121,6 @@ async def tg_notify_photo(photo_path: str, caption: str = ""):
     chat_id = os.environ.get("TG_CHAT_ID", "").strip()
     if not token or not chat_id or not os.path.exists(photo_path):
         return
-    
     try:
         async with aiohttp.ClientSession() as session:
             with open(photo_path, "rb") as f:
@@ -148,16 +146,13 @@ async def tg_notify_photo(photo_path: str, caption: str = ""):
 async def update_github_secret(secret_name: str, secret_value: str) -> bool:
     repo_token = os.environ.get("REPO_TOKEN", "").strip()
     repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    
     if not repo_token or not repository or not NACL_AVAILABLE:
         return False
-    
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {repo_token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    
     async with aiohttp.ClientSession() as session:
         try:
             pk_url = f"https://api.github.com/repos/{repository}/actions/secrets/public-key"
@@ -165,11 +160,9 @@ async def update_github_secret(secret_name: str, secret_value: str) -> bool:
                 if resp.status != 200:
                     return False
                 pk_data = await resp.json()
-            
             encrypted_value = encrypt_secret(pk_data["key"], secret_value)
             secret_url = f"https://api.github.com/repos/{repository}/actions/secrets/{secret_name}"
             payload = {"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]}
-            
             async with session.put(secret_url, headers=headers, json=payload) as resp:
                 if resp.status in (201, 204):
                     print(f"[GitHub] ✓ Secret {secret_name} 已更新")
@@ -184,7 +177,6 @@ async def update_github_secret(secret_name: str, secret_value: str) -> bool:
 # ============================================================
 async def wait_for_cloudflare(page: Page, timeout: int = 120) -> bool:
     print("[CF] 检测验证状态...")
-    
     for i in range(timeout):
         try:
             is_cf = await page.evaluate("""
@@ -198,11 +190,9 @@ async def wait_for_cloudflare(page: Page, timeout: int = 120) -> bool:
                     return false;
                 }
             """)
-            
             if not is_cf:
                 print(f"[CF] ✓ 验证通过 ({i+1}s)")
                 return True
-            
             if i == 5 or i == 15 or i == 30:
                 try:
                     await page.evaluate("""
@@ -213,22 +203,17 @@ async def wait_for_cloudflare(page: Page, timeout: int = 120) -> bool:
                     """)
                 except:
                     pass
-            
             if i % 15 == 0 and i > 0:
                 print(f"[CF] 等待中... ({i}s)")
-            
             await page.wait_for_timeout(1000)
-            
         except:
             await page.wait_for_timeout(1000)
-    
     print(f"[CF] ✗ 超时 ({timeout}s)")
     return False
 
 
 async def handle_turnstile(page: Page, timeout: int = 60) -> bool:
     print("[Turnstile] 检测验证...")
-    
     for i in range(timeout):
         try:
             has_response = await page.evaluate("""
@@ -237,11 +222,9 @@ async def handle_turnstile(page: Page, timeout: int = 60) -> bool:
                     return input && input.value && input.value.length > 20;
                 }
             """)
-            
             if has_response:
                 print(f"[Turnstile] ✓ 验证完成 ({i+1}s)")
                 return True
-            
             if i == 3 or i == 10 or i == 20:
                 await page.evaluate("""
                     () => {
@@ -251,15 +234,11 @@ async def handle_turnstile(page: Page, timeout: int = 60) -> bool:
                         if (iframe) iframe.click();
                     }
                 """)
-            
             if i % 15 == 0 and i > 0:
                 print(f"[Turnstile] 等待中... ({i}s)")
-            
             await page.wait_for_timeout(1000)
-            
         except:
             await page.wait_for_timeout(1000)
-    
     return False
 
 
@@ -329,7 +308,6 @@ async def click_confirm_button(page: Page):
 
 
 async def extract_cookie(context: BrowserContext) -> Optional[str]:
-    """提取完整 Cookie 字符串"""
     try:
         cookies = await context.cookies()
         for cookie in cookies:
@@ -360,7 +338,6 @@ async def renew_server(page: Page, server_url: str) -> Dict:
     print(f"[续期] {masked_id}")
     print('=' * 50)
     
-    # API 响应捕获
     renew_result = {"captured": False, "status": None, "body": None}
     
     async def capture_response(response):
@@ -384,14 +361,12 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         await wait_for_cloudflare(page, timeout=90)
         await page.wait_for_timeout(2000)
         
-        # 检查登录状态
         if "/auth/login" in page.url or "/login" in page.url:
             result["message"] = "Cookie 已失效"
             print(f"[续期] ✗ {result['message']}")
             await page.screenshot(path="login_required.png")
             return result
         
-        # 获取当前到期时间
         result["expiry_before"] = await get_expiry_time(page)
         if result["expiry_before"] != "Unknown":
             remaining = calculate_remaining_time(result["expiry_before"])
@@ -399,7 +374,6 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         
         await page.screenshot(path=f"server_{masked_id[:8]}.png")
         
-        # 点击续期按钮
         print("[续期] 查找续期按钮...")
         if not await find_and_click_renew_button(page):
             result["message"] = "未找到续期按钮"
@@ -411,14 +385,10 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         await page.wait_for_timeout(2000)
         await page.screenshot(path="renew_clicked.png")
         
-        # 处理 Turnstile 验证
         await handle_turnstile(page, timeout=60)
-        
-        # 点击确认
         await click_confirm_button(page)
         await page.wait_for_timeout(3000)
         
-        # 等待 API 响应
         print("[续期] 等待 API 响应...")
         for i in range(30):
             if renew_result["captured"]:
@@ -427,7 +397,6 @@ async def renew_server(page: Page, server_url: str) -> Dict:
         
         await page.screenshot(path="renew_result.png")
         
-        # 处理结果
         if renew_result["captured"]:
             status = renew_result["status"]
             body = renew_result["body"]
@@ -435,19 +404,16 @@ async def renew_server(page: Page, server_url: str) -> Dict:
             if status in (200, 201, 204):
                 result["success"] = True
                 result["message"] = "续期成功"
-                
                 await page.wait_for_timeout(2000)
                 await page.reload()
                 await wait_for_cloudflare(page, timeout=30)
                 await page.wait_for_timeout(2000)
-                
                 result["expiry_after"] = await get_expiry_time(page)
                 if result["expiry_after"] != "Unknown":
                     new_remaining = calculate_remaining_time(result["expiry_after"])
                     print(f"[续期] ✓ 成功！新到期: {result['expiry_after']} ({new_remaining})")
                 else:
                     print("[续期] ✓ 成功！")
-                    
             elif status == 400:
                 error_text = str(body) if body else ""
                 if is_cooldown_error(error_text):
@@ -470,11 +436,9 @@ async def renew_server(page: Page, server_url: str) -> Dict:
             else:
                 result["message"] = "未检测到 API 响应"
                 print(f"[续期] ⚠ {result['message']}")
-        
     except Exception as e:
         result["message"] = f"异常: {str(e)[:50]}"
         print(f"[续期] ✗ {result['message']}")
-    
     finally:
         page.remove_listener("response", capture_response)
     
@@ -482,7 +446,6 @@ async def renew_server(page: Page, server_url: str) -> Dict:
 
 
 async def main():
-    # 获取配置
     cookie_str = os.environ.get("WEIRDHOST_COOKIE", "").strip()
     server_url = os.environ.get("WEIRDHOST_SERVER_URL", "").strip()
     
@@ -496,13 +459,13 @@ async def main():
         await tg_notify("❌ <b>WeirdHost 续期失败</b>\n\nWEIRDHOST_SERVER_URL 未设置")
         sys.exit(1)
     
-    # 解析 Cookie
     cookie_name, cookie_value = parse_cookie(cookie_str)
     
     print(f"\n{'=' * 60}")
     print("WeirdHost 自动续期脚本 v7")
     print(f"{'=' * 60}")
-    print(f"Cookie: {cookie_name}={mask_string(cookie_value, 8)}")
+    print(f"Cookie Name: {cookie_name}")
+    print(f"Cookie Value: {mask_string(cookie_value, 8)}")
     print(f"Server: {server_url}")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'=' * 60}")
@@ -534,7 +497,6 @@ async def main():
         page.set_default_timeout(60000)
         
         try:
-            # 设置 Cookie
             print(f"[Cookie] 设置: {cookie_name}")
             await context.add_cookies([{
                 "name": cookie_name,
@@ -543,16 +505,13 @@ async def main():
                 "path": "/",
             }])
             
-            # 续期
             result = await renew_server(page, server_url)
             
-            # 检查并更新 Cookie
             new_cookie = await extract_cookie(context)
             if new_cookie and new_cookie != cookie_str:
-                print(f"\n[Cookie] 检测到新 Cookie，尝试更新...")
+                print("\n[Cookie] 检测到新 Cookie，尝试更新...")
                 await update_github_secret("WEIRDHOST_COOKIE", new_cookie)
             
-            # 发送通知
             if result["success"]:
                 expiry_info = ""
                 if result["expiry_after"]:
@@ -567,7 +526,7 @@ async def main():
             else:
                 await tg_notify_photo("renew_result.png", f"❌ <b>WeirdHost 续期失败</b>\n\n❗ {result['message']}")
                 sys.exit(1)
-            
+        
         except Exception as e:
             print(f"\n[异常] {e}")
             import traceback
