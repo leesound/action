@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v18
-- 使用 Playwright 浏览器自动化
-- 滚动到底部找续期按钮
-- 支持自动更新 Cookie
+WeirdHost 自动续期 v19
+- 优化超时和重试
+- 改用 domcontentloaded
 """
 
 import os
@@ -20,6 +19,8 @@ from base64 import b64encode, b64decode
 # ==================== 配置 ====================
 
 BASE_URL = "https://hub.weirdhost.xyz"
+PAGE_TIMEOUT = 120000  # 2分钟
+RETRY_COUNT = 3
 
 # ==================== 工具函数 ====================
 
@@ -55,59 +56,45 @@ def calculate_remaining_time(expiry_str: str) -> str:
 # ==================== GitHub API ====================
 
 def update_github_secret(secret_name: str, secret_value: str) -> bool:
-    """更新 GitHub Secret"""
     token = os.environ.get("REPO_TOKEN", "").strip()
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     
     if not token or not repo:
-        print("[GitHub] 未配置 REPO_TOKEN 或 GITHUB_REPOSITORY，跳过更新")
         return False
     
     try:
-        print(f"[GitHub] 获取仓库 {repo} 的公钥...")
         key_url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
         req = urllib.request.Request(key_url)
         req.add_header("Authorization", f"token {token}")
         req.add_header("Accept", "application/vnd.github.v3+json")
-        req.add_header("User-Agent", "WeirdHost-Renew-Script")
+        req.add_header("User-Agent", "WeirdHost-Renew")
         
         with urllib.request.urlopen(req, timeout=30) as resp:
             key_data = json.loads(resp.read().decode('utf-8'))
         
-        public_key = key_data["key"]
-        key_id = key_data["key_id"]
+        from nacl import encoding, public
+        public_key_bytes = b64decode(key_data["key"])
+        sealed_box = public.SealedBox(public.PublicKey(public_key_bytes))
+        encrypted = sealed_box.encrypt(secret_value.encode('utf-8'))
+        encrypted_value = b64encode(encrypted).decode('utf-8')
         
-        try:
-            from nacl import encoding, public
-            
-            public_key_bytes = b64decode(public_key)
-            sealed_box = public.SealedBox(public.PublicKey(public_key_bytes))
-            encrypted = sealed_box.encrypt(secret_value.encode('utf-8'))
-            encrypted_value = b64encode(encrypted).decode('utf-8')
-        except ImportError:
-            print("[GitHub] ⚠ 需要 PyNaCl 库")
-            return False
-        
-        print(f"[GitHub] 更新 Secret: {secret_name}...")
         secret_url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
         data = json.dumps({
             "encrypted_value": encrypted_value,
-            "key_id": key_id
+            "key_id": key_data["key_id"]
         }).encode('utf-8')
         
         req = urllib.request.Request(secret_url, data=data, method="PUT")
         req.add_header("Authorization", f"token {token}")
         req.add_header("Accept", "application/vnd.github.v3+json")
         req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "WeirdHost-Renew-Script")
+        req.add_header("User-Agent", "WeirdHost-Renew")
         
         with urllib.request.urlopen(req, timeout=30) as resp:
             if resp.status in (201, 204):
-                print(f"[GitHub] ✓ Secret {secret_name} 已更新")
+                print(f"[GitHub] ✓ Secret 已更新")
                 return True
-        
         return False
-        
     except Exception as e:
         print(f"[GitHub] ✗ 更新失败: {e}")
         return False
@@ -147,7 +134,6 @@ def notify_telegram(message: str, proxy: Optional[str] = None):
 # ==================== 浏览器自动化 ====================
 
 def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
-    """解析 Cookie 字符串为字典"""
     cookie_str = urllib.parse.unquote(cookie_str.strip())
     cookies = {}
     for part in cookie_str.split(";"):
@@ -159,7 +145,6 @@ def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
 
 
 def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = None) -> Dict:
-    """使用 Playwright 进行续期"""
     from playwright.sync_api import sync_playwright
     
     result = {
@@ -171,14 +156,25 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
         "new_cookie": None
     }
     
-    # 解析 Cookie
     cookies = parse_cookie_string(cookie_str)
     
     with sync_playwright() as p:
-        # 启动浏览器
-        browser_args = ["--no-sandbox", "--disable-setuid-sandbox"]
+        # 浏览器配置
+        browser_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        
+        # 代理配置
+        proxy_config = None
         if proxy:
-            browser_args.append(f"--proxy-server={proxy}")
+            # 解析代理 URL
+            if proxy.startswith("http://"):
+                proxy_host = proxy[7:]
+            elif proxy.startswith("https://"):
+                proxy_host = proxy[8:]
+            else:
+                proxy_host = proxy
+            
+            proxy_config = {"server": f"http://{proxy_host}"}
+            print(f"[浏览器] 使用代理: {proxy_host}")
         
         browser = p.chromium.launch(
             headless=True,
@@ -187,7 +183,8 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
         
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            proxy=proxy_config
         )
         
         # 设置 Cookie
@@ -204,111 +201,102 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
             context.add_cookies(cookie_list)
         
         page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT)
         
         try:
-            # 访问服务器页面
             server_url = f"{BASE_URL}/server/{server_id}"
-            print(f"[浏览器] 访问 {server_url}")
             
-            page.goto(server_url, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
+            # 重试机制
+            for attempt in range(RETRY_COUNT):
+                try:
+                    print(f"[浏览器] 访问 {server_url} (尝试 {attempt + 1}/{RETRY_COUNT})")
+                    page.goto(server_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                    break
+                except Exception as e:
+                    if attempt < RETRY_COUNT - 1:
+                        print(f"[浏览器] 访问失败，重试中... ({e})")
+                        time.sleep(5)
+                    else:
+                        raise e
+            
+            # 等待页面加载
+            print("[浏览器] 等待页面加载...")
+            time.sleep(5)
             
             # 检查是否需要登录
-            if "/login" in page.url or "login" in page.url.lower():
+            if "/login" in page.url:
                 result["cookie_expired"] = True
-                result["message"] = "Cookie 已失效，需要重新登录"
+                result["message"] = "Cookie 已失效"
                 print("[浏览器] ✗ Cookie 已失效")
                 browser.close()
                 return result
             
-            # 滚动到页面底部
-            print("[浏览器] 滚动到页面底部...")
+            # 等待内容加载
+            try:
+                page.wait_for_selector("button", timeout=30000)
+            except:
+                pass
+            
+            # 滚动到底部
+            print("[浏览器] 滚动页面...")
+            for _ in range(5):
+                page.evaluate("window.scrollBy(0, 500)")
+                time.sleep(0.5)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(2)
             
-            # 多次滚动确保加载完成
-            for _ in range(3):
-                page.evaluate("window.scrollBy(0, 500)")
-                time.sleep(0.5)
-            
-            # 截图调试
+            # 截图
             page.screenshot(path="debug_before_renew.png", full_page=True)
-            print("[浏览器] 已保存截图: debug_before_renew.png")
+            print("[浏览器] 已保存截图")
             
-            # 获取到期时间 - 查找 유통기한 (有效期)
-            try:
-                page_content = page.content()
-                # 匹配 유통기한 2026-02-13 00:06:57 格式
-                expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_content)
-                if expiry_match:
-                    result["expiry"] = expiry_match.group(1)
-                    print(f"[浏览器] 到期时间: {result['expiry']}")
-                else:
-                    # 尝试其他格式
-                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', page_content)
-                    if date_match:
-                        result["expiry"] = date_match.group(1)
-                        print(f"[浏览器] 到期时间: {result['expiry']}")
-            except Exception as e:
-                print(f"[浏览器] 获取到期时间失败: {e}")
+            # 获取到期时间
+            page_content = page.content()
+            expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_content)
+            if expiry_match:
+                result["expiry"] = expiry_match.group(1)
+                print(f"[浏览器] 到期时间: {result['expiry']}")
             
-            # 查找续期按钮 - 시간추가 (添加时间)
+            # 查找续期按钮
             renew_button = None
             
-            # 尝试多种选择器
+            # 方法1: 直接选择器
             selectors = [
-                "button:has-text('시간추가')",  # 韩文：添加时间
+                "button:has-text('시간추가')",
                 "button:has-text('Renew')",
-                "button:has-text('renew')",
-                "button:has-text('续期')",
-                "button:has-text('갱신')",  # 韩文：更新
-                "button.bkrtgq",  # 从 HTML 中看到的 class
-                "button[color='primary']",
+                "span:has-text('시간추가')",
             ]
             
             for selector in selectors:
                 try:
-                    btn = page.query_selector(selector)
-                    if btn and btn.is_visible():
-                        renew_button = btn
-                        print(f"[浏览器] 找到续期按钮: {selector}")
+                    elem = page.query_selector(selector)
+                    if elem and elem.is_visible():
+                        # 如果是 span，找父级 button
+                        tag = elem.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "span":
+                            renew_button = elem.evaluate_handle("el => el.closest('button')")
+                        else:
+                            renew_button = elem
+                        print(f"[浏览器] 找到按钮: {selector}")
                         break
                 except:
                     continue
             
-            # 如果还没找到，遍历所有按钮
+            # 方法2: 遍历按钮
             if not renew_button:
                 buttons = page.query_selector_all("button")
                 for btn in buttons:
                     try:
                         text = btn.inner_text().strip()
-                        # 시간추가 = 添加时间
-                        if "시간추가" in text or "시간" in text or "추가" in text:
-                            renew_button = btn
-                            print(f"[浏览器] 通过文本找到按钮: {text}")
-                            break
-                        if "renew" in text.lower():
-                            renew_button = btn
-                            print(f"[浏览器] 通过文本找到按钮: {text}")
-                            break
-                    except:
-                        continue
-            
-            if not renew_button:
-                # 最后尝试：找第一个 primary 颜色的按钮（不是红色删除按钮）
-                buttons = page.query_selector_all("button")
-                for btn in buttons:
-                    try:
-                        # 排除删除按钮（红色）
-                        class_name = btn.get_attribute("class") or ""
-                        color = btn.get_attribute("color") or ""
-                        if "red" in class_name.lower() or color == "red":
+                        class_attr = btn.get_attribute("class") or ""
+                        color_attr = btn.get_attribute("color") or ""
+                        
+                        # 跳过删除按钮
+                        if "red" in class_attr or color_attr == "red" or "Delete" in text:
                             continue
-                        if "Delete" in (btn.inner_text() or ""):
-                            continue
-                        if btn.is_visible():
+                        
+                        if "시간추가" in text or "시간" in text:
                             renew_button = btn
-                            print(f"[浏览器] 使用第一个非删除按钮")
+                            print(f"[浏览器] 找到按钮: {text}")
                             break
                     except:
                         continue
@@ -316,82 +304,68 @@ def run_browser_renew(cookie_str: str, server_id: str, proxy: Optional[str] = No
             if not renew_button:
                 result["message"] = "未找到续期按钮"
                 print("[浏览器] ✗ 未找到续期按钮")
-                page.screenshot(path="debug_no_button.png", full_page=True)
+                
+                # 打印页面上所有按钮用于调试
+                buttons = page.query_selector_all("button")
+                print(f"[调试] 页面上共有 {len(buttons)} 个按钮:")
+                for i, btn in enumerate(buttons):
+                    try:
+                        text = btn.inner_text().strip()[:50]
+                        print(f"  [{i}] {text}")
+                    except:
+                        pass
+                
                 browser.close()
                 return result
             
-            # 滚动到按钮位置
+            # 点击按钮
+            print("[浏览器] 点击续期按钮...")
             renew_button.scroll_into_view_if_needed()
             time.sleep(1)
-            
-            # 点击续期按钮
-            print("[浏览器] 点击续期按钮...")
             renew_button.click()
             time.sleep(5)
             
             # 截图
             page.screenshot(path="debug_after_click.png", full_page=True)
-            print("[浏览器] 已保存截图: debug_after_click.png")
             
             # 检查结果
-            page_content = page.content()
-            page_text = page_content.lower()
+            new_content = page.content().lower()
             
-            # 检查是否在冷却期
-            cooldown_keywords = [
-                "아직", "갱신할 수 없습니다", "cooldown", "wait", 
-                "too early", "not yet", "기다려", "남았습니다"
-            ]
-            for keyword in cooldown_keywords:
-                if keyword in page_text:
-                    result["is_cooldown"] = True
-                    result["message"] = "冷却期内，无法续期"
-                    print("[浏览器] ⏳ 冷却期内")
-                    break
-            
-            # 检查是否成功
-            success_keywords = [
-                "success", "성공", "renewed", "续期成功", 
-                "갱신되었습니다", "완료", "추가되었습니다"
-            ]
-            for keyword in success_keywords:
-                if keyword in page_text:
-                    result["success"] = True
-                    result["message"] = "续期成功"
-                    print("[浏览器] ✓ 续期成功")
-                    break
-            
-            # 如果没有明确结果，刷新检查到期时间变化
-            if not result["success"] and not result["is_cooldown"]:
-                print("[浏览器] 刷新页面检查结果...")
-                page.reload(wait_until="networkidle")
+            # 冷却期检查
+            if any(kw in new_content for kw in ["아직", "cooldown", "wait", "기다려"]):
+                result["is_cooldown"] = True
+                result["message"] = "冷却期内"
+                print("[浏览器] ⏳ 冷却期内")
+            # 成功检查
+            elif any(kw in new_content for kw in ["success", "성공", "완료", "추가되었"]):
+                result["success"] = True
+                result["message"] = "续期成功"
+                print("[浏览器] ✓ 续期成功")
+            else:
+                # 刷新检查时间变化
+                page.reload(wait_until="domcontentloaded")
                 time.sleep(3)
-                
                 new_content = page.content()
-                new_expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_content)
-                if new_expiry_match:
-                    new_expiry = new_expiry_match.group(1)
+                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_content)
+                if new_match:
+                    new_expiry = new_match.group(1)
                     if result["expiry"] and new_expiry > result["expiry"]:
                         result["success"] = True
                         result["expiry"] = new_expiry
                         result["message"] = "续期成功"
                         print(f"[浏览器] ✓ 续期成功，新到期: {new_expiry}")
-                    elif new_expiry:
+                    else:
+                        result["is_cooldown"] = True
+                        result["message"] = "可能在冷却期"
                         result["expiry"] = new_expiry
-                        # 如果时间没变，可能是冷却期
-                        if not result["message"]:
-                            result["is_cooldown"] = True
-                            result["message"] = "可能在冷却期内"
             
             # 获取新 Cookie
             try:
-                new_cookies = context.cookies()
-                for cookie in new_cookies:
+                for cookie in context.cookies():
                     if cookie["name"].startswith("remember_web"):
                         new_cookie_str = f"{cookie['name']}={cookie['value']}"
                         if new_cookie_str != cookie_str:
                             result["new_cookie"] = new_cookie_str
-                            print("[浏览器] 检测到新 Cookie")
                         break
             except:
                 pass
@@ -417,50 +391,40 @@ def main():
     server_id = os.environ.get("WEIRDHOST_ID", "").strip()
     proxy = os.environ.get("HTTP_PROXY", "").strip()
     
-    if not cookie:
-        print("❌ 请设置 WEIRDHOST_COOKIE")
-        notify_telegram("❌ <b>WeirdHost 续期失败</b>\n\nCookie 未设置")
-        sys.exit(1)
-    
-    if not server_id:
-        print("❌ 请设置 WEIRDHOST_ID")
-        notify_telegram("❌ <b>WeirdHost 续期失败</b>\n\nServer ID 未设置")
+    if not cookie or not server_id:
+        print("❌ 请设置 WEIRDHOST_COOKIE 和 WEIRDHOST_ID")
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v18 (Playwright)")
+    print("WeirdHost 自动续期 v19")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"代理: {proxy if proxy else '无'}")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 50)
     
-    # 运行浏览器续期
     result = run_browser_renew(cookie, server_id, proxy if proxy else None)
     
-    # 检查是否需要更新 Cookie
+    # 更新 Cookie
     if result.get("new_cookie"):
-        print("[Cookie] 检测到新 Cookie，尝试更新...")
-        if update_github_secret("WEIRDHOST_COOKIE", result["new_cookie"]):
-            notify_telegram("🔄 <b>Cookie 已自动更新</b>\n\nGitHub Secret 已更新为新 Cookie", proxy)
+        update_github_secret("WEIRDHOST_COOKIE", result["new_cookie"])
     
     # 发送通知
+    remaining = calculate_remaining_time(result["expiry"]) if result["expiry"] else ""
+    
     if result["success"]:
-        remaining = calculate_remaining_time(result["expiry"]) if result["expiry"] else ""
         msg = f"✅ <b>WeirdHost 续期成功</b>\n\n📅 到期: {result['expiry']}\n⏳ 剩余: {remaining}"
         notify_telegram(msg, proxy)
         sys.exit(0)
     elif result["is_cooldown"]:
-        remaining = calculate_remaining_time(result["expiry"]) if result["expiry"] else ""
         msg = f"ℹ️ <b>WeirdHost 冷却期</b>\n\n📅 到期: {result['expiry']}\n⏳ 剩余: {remaining}"
         notify_telegram(msg, proxy)
         sys.exit(0)
     elif result["cookie_expired"]:
-        msg = "❌ <b>WeirdHost Cookie 已失效</b>\n\n请手动更新 WEIRDHOST_COOKIE Secret"
-        notify_telegram(msg, proxy)
+        notify_telegram("❌ <b>WeirdHost Cookie 已失效</b>\n\n请手动更新", proxy)
         sys.exit(1)
     else:
-        notify_telegram(f"❌ <b>WeirdHost 续期失败</b>\n\n❗ {result['message']}", proxy)
+        notify_telegram(f"❌ <b>WeirdHost 续期失败</b>\n\n{result['message']}", proxy)
         sys.exit(1)
 
 
