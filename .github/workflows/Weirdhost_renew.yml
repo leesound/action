@@ -2,20 +2,23 @@ name: WeirdHost 自动续期
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'
+    - cron: '15 16 * * *'  # 每天北京时间 00:15
   workflow_dispatch:
-
-env:
-  TZ: Asia/Shanghai
+    inputs:
+      force_renew:
+        description: '强制续期'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write
       actions: write
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -31,22 +34,34 @@ jobs:
           sudo apt-get install -y \
             xvfb \
             libgtk-3-0 \
-            libnotify4 \
+            libnotify-dev \
             libnss3 \
             libxss1 \
             libasound2t64 \
-            fonts-noto-cjk \
-            xdg-utils
+            libxtst6 \
+            xauth \
+            fonts-liberation \
+            libgbm1 \
+            libxkbcommon0 \
+            libvulkan1 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libpango-1.0-0 \
+            libcairo2 \
+            wget \
+            curl
 
       - name: 安装 Python 依赖
         run: |
           pip install --upgrade pip
-          pip install seleniumbase pyvirtualdisplay aiohttp pynacl
-
-      - name: 安装浏览器
-        run: |
+          pip install seleniumbase pyvirtualdisplay aiohttp pyautogui
           seleniumbase install chromedriver
-          seleniumbase install uc_driver
+          seleniumbase install chrome
 
       - name: 下载 Hysteria2
         run: |
@@ -99,27 +114,24 @@ jobs:
             
             if curl -s --proxy http://127.0.0.1:8080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
               echo "✅ 代理已启动并可用"
-              echo "PROXY_AVAILABLE=true" >> $GITHUB_ENV
+              echo "USE_PROXY=true" >> $GITHUB_ENV
             else
               echo "⚠️ 代理启动但可能不可用，继续执行..."
-              echo "PROXY_AVAILABLE=false" >> $GITHUB_ENV
+              cat hysteria.log || true
             fi
           else
             echo "⚠️ 无代理配置，直接连接"
-            echo "PROXY_AVAILABLE=false" >> $GITHUB_ENV
           fi
 
       - name: 运行续期脚本
         env:
           WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
           WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
-          WEIRDHOST_COOKIES: ${{ secrets.WEIRDHOST_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          USE_PROXY: ${{ env.PROXY_AVAILABLE }}
-        run: python scripts/weirdhost_renew.py
+          USE_PROXY: ${{ env.USE_PROXY }}
+        run: |
+          python scripts/weirdhost_renew.py
 
       - name: 上传截图
         if: always()
@@ -128,22 +140,18 @@ jobs:
           name: screenshots-${{ github.run_number }}
           path: "*.png"
           retention-days: 3
-          if-no-files-found: ignore
 
       - name: 清理
         if: always()
         run: |
-          rm -f *.png hysteria.log hy2-config.yaml
           pkill -f hysteria || true
-          pkill -f chrome || true
-          pkill -f chromedriver || true
 
-      - name: 清理旧运行（保留最近 3 次）
+      - name: 删除旧运行记录
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          delete_workflow_pattern: WeirdHost 自动续期
+          delete_workflow_pattern: "WeirdHost 自动续期"
           retain_days: 0
           keep_minimum_runs: 3
