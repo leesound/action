@@ -2,13 +2,12 @@ name: WeirdHost 自动续期
 
 on:
   schedule:
-    - cron: '0 */8 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     
     steps:
       - name: 检出代码
@@ -21,7 +20,7 @@ jobs:
       
       - name: 安装依赖
         run: pip install pynacl
-
+      
       - name: 下载 Hysteria2
         run: |
           wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
