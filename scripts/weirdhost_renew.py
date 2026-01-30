@@ -417,8 +417,8 @@ class WeirdHostRenewer:
                 except Exception:
                     continue
             
-            # 7. 加载 reCAPTCHA Cookies（关键步骤！）
-            log("加载 reCAPTCHA Cookies...", "STEP")
+            # 7. 注入 reCAPTCHA Cookies（关键步骤！）
+            log("注入 reCAPTCHA Cookies...", "STEP")
             self.load_recaptcha_cookies()
             time.sleep(1)
             
