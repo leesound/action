@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v29
-- 修复 SeleniumBase UC Mode API
+WeirdHost 自动续期 v30
+- 修复按钮选择器
 """
 
 import os
@@ -214,7 +214,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
     cookies = parse_cookie_string(cookie_str)
     server_url = f"{BASE_URL}/server/{server_id}"
     
-    # 构建代理参数
     proxy_arg = None
     if socks_proxy:
         proxy_addr = socks_proxy.replace("socks5://", "").replace("socks5h://", "")
@@ -271,10 +270,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             sb.sleep(5)
             sb.save_screenshot("debug_before.png")
             
-            # 滚动页面
-            sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-            sb.sleep(2)
-            
             # 获取到期时间
             page_source = sb.get_page_source()
             expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_source)
@@ -282,39 +277,119 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 result["expiry"] = expiry_match.group(1)
                 print(f"[浏览器] 到期时间: {result['expiry']}")
             
-            # 查找续期按钮
+            # 查找续期按钮 - 多种选择器
             print("[浏览器] 查找续期按钮...")
-            button_xpath = "//button[contains(text(), '시간추가')]"
             
-            try:
-                if sb.is_element_present(button_xpath):
-                    print("[浏览器] 找到续期按钮")
-                    
-                    # 滚动到按钮
-                    sb.execute_script(
-                        "document.evaluate(arguments[0], document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue.scrollIntoView({block: 'center'});",
-                        button_xpath
-                    )
-                    sb.sleep(1)
-                    
-                    # 点击按钮
-                    print("[浏览器] 点击续期按钮...")
-                    sb.uc_click(button_xpath)
-                else:
-                    result["message"] = "未找到续期按钮"
-                    sb.save_screenshot(SCREENSHOT_PATH)
-                    result["screenshot"] = SCREENSHOT_PATH
-                    return result
-            except Exception as e:
-                print(f"[浏览器] 按钮操作异常: {e}")
-                # 尝试备用方法
+            # 按钮选择器列表（按优先级）
+            button_selectors = [
+                # 包含 "시간추가" 文字的按钮
+                "button:contains('시간추가')",
+                # 包含 "시간" 文字的按钮
+                "button:contains('시간')",
+                # 红色/警告色按钮（通常是续期按钮）
+                "button.bg-red-500",
+                "button.bg-red-600",
+                "button[class*='red']",
+                "button[class*='danger']",
+                "button[class*='warning']",
+                # 通过 XPath
+                "xpath://button[contains(text(), '시간추가')]",
+                "xpath://button[contains(text(), '시간')]",
+                "xpath://button[contains(., '시간추가')]",
+                "xpath://button[contains(., '시간')]",
+                # 通过按钮样式
+                "xpath://button[contains(@class, 'red')]",
+            ]
+            
+            button_found = False
+            used_selector = None
+            
+            for selector in button_selectors:
                 try:
-                    sb.click(button_xpath)
-                except:
-                    result["message"] = f"点击按钮失败: {e}"
-                    sb.save_screenshot(SCREENSHOT_PATH)
-                    result["screenshot"] = SCREENSHOT_PATH
-                    return result
+                    if selector.startswith("xpath:"):
+                        xpath = selector[6:]
+                        if sb.is_element_present(xpath):
+                            used_selector = xpath
+                            button_found = True
+                            print(f"[浏览器] 找到按钮 (XPath): {xpath}")
+                            break
+                    else:
+                        if sb.is_element_present(selector):
+                            used_selector = selector
+                            button_found = True
+                            print(f"[浏览器] 找到按钮 (CSS): {selector}")
+                            break
+                except Exception as e:
+                    continue
+            
+            # 如果还没找到，用 JavaScript 查找
+            if not button_found:
+                print("[浏览器] 尝试 JavaScript 查找按钮...")
+                js_find = """
+                var buttons = document.querySelectorAll('button');
+                for (var i = 0; i < buttons.length; i++) {
+                    var text = buttons[i].innerText || buttons[i].textContent;
+                    if (text.includes('시간') || text.includes('추가') || text.includes('갱신')) {
+                        return i;
+                    }
+                }
+                return -1;
+                """
+                btn_index = sb.execute_script(js_find)
+                if btn_index >= 0:
+                    button_found = True
+                    used_selector = f"js_index:{btn_index}"
+                    print(f"[浏览器] 找到按钮 (JS index): {btn_index}")
+            
+            if not button_found:
+                # 输出页面上所有按钮的文字用于调试
+                all_buttons = sb.execute_script("""
+                var buttons = document.querySelectorAll('button');
+                var texts = [];
+                for (var i = 0; i < buttons.length; i++) {
+                    texts.push(i + ': ' + (buttons[i].innerText || buttons[i].textContent).trim().substring(0, 50));
+                }
+                return texts.join('\\n');
+                """)
+                print(f"[浏览器] 页面上的按钮:\n{all_buttons}")
+                
+                result["message"] = "未找到续期按钮"
+                sb.save_screenshot(SCREENSHOT_PATH)
+                result["screenshot"] = SCREENSHOT_PATH
+                return result
+            
+            # 点击按钮
+            print("[浏览器] 点击续期按钮...")
+            try:
+                if used_selector.startswith("js_index:"):
+                    idx = int(used_selector.split(":")[1])
+                    sb.execute_script(f"""
+                    var buttons = document.querySelectorAll('button');
+                    buttons[{idx}].scrollIntoView({{block: 'center'}});
+                    """)
+                    sb.sleep(0.5)
+                    sb.execute_script(f"""
+                    var buttons = document.querySelectorAll('button');
+                    buttons[{idx}].click();
+                    """)
+                else:
+                    # 滚动到按钮
+                    sb.execute_script(f"""
+                    var el = document.querySelector("{used_selector.replace('"', '\\"')}");
+                    if (el) el.scrollIntoView({{block: 'center'}});
+                    """)
+                    sb.sleep(0.5)
+                    sb.uc_click(used_selector)
+            except Exception as e:
+                print(f"[浏览器] uc_click 失败: {e}，尝试普通点击")
+                try:
+                    sb.click(used_selector)
+                except Exception as e2:
+                    print(f"[浏览器] 普通点击也失败: {e2}，尝试 JS 点击")
+                    sb.execute_script(f"""
+                    var el = document.querySelector("{used_selector.replace('"', '\\"')}");
+                    if (el) el.click();
+                    """)
             
             # 等待结果
             print("[浏览器] 等待操作结果...")
@@ -339,7 +414,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 try:
                     current_source = sb.get_page_source()
                     
-                    # 优先检查冷却期
                     for kw in cooldown_keywords:
                         if kw in current_source:
                             result["is_cooldown"] = True
@@ -350,7 +424,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                     if result["is_cooldown"]:
                         break
                     
-                    # 检查成功
                     for kw in success_keywords:
                         if kw in current_source:
                             result["success"] = True
@@ -361,7 +434,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                     if result["success"]:
                         break
                     
-                    # 检查到期时间变化
                     new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', current_source)
                     if new_match:
                         new_expiry = new_match.group(1)
@@ -378,7 +450,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 if i % 5 == 4:
                     print(f"[浏览器] 等待中... ({i+1}秒)")
             
-            # 保存截图
             sb.sleep(2)
             sb.save_screenshot(SCREENSHOT_PATH)
             result["screenshot"] = SCREENSHOT_PATH
@@ -399,7 +470,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 result["message"] = "未检测到明确结果"
                 print("[浏览器] ✗ 未检测到明确结果")
             
-            # 获取新 Cookie
             try:
                 for cookie in sb.get_cookies():
                     if cookie["name"].startswith("remember_web"):
@@ -431,7 +501,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v29 (SeleniumBase UC Mode)")
+    print("WeirdHost 自动续期 v30 (SeleniumBase UC Mode)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
