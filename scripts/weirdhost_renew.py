@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v27
-- 修复冷却期检测逻辑
+WeirdHost 自动续期 v28
+- SeleniumBase UC Mode (操作系统级鼠标模拟)
 """
 
 import os
@@ -199,7 +199,7 @@ def parse_cookie_string(cookie_str: str) -> Dict[str, str]:
 
 
 def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str] = None) -> Dict:
-    from seleniumbase import Driver
+    from seleniumbase import SB
     
     result = {
         "success": False,
@@ -214,228 +214,198 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
     cookies = parse_cookie_string(cookie_str)
     server_url = f"{BASE_URL}/server/{server_id}"
     
-    driver = None
+    # 构建代理参数
+    proxy_arg = None
+    if socks_proxy:
+        proxy_addr = socks_proxy.replace("socks5://", "").replace("socks5h://", "")
+        proxy_arg = f"socks5://{proxy_addr}"
+        print(f"[浏览器] 使用 SOCKS5 代理: {proxy_addr}")
+    
     try:
-        # 构建代理参数
-        proxy_arg = None
-        if socks_proxy:
-            proxy_addr = socks_proxy.replace("socks5://", "").replace("socks5h://", "")
-            proxy_arg = f"socks5://{proxy_addr}"
-            print(f"[浏览器] 使用 SOCKS5 代理: {proxy_addr}")
+        # 使用 SeleniumBase UC Mode
+        print("[浏览器] 启动 Chrome (UC Mode)...")
         
-        # 启动浏览器
-        print("[浏览器] 启动 Chrome...")
-        driver = Driver(
-            browser="chrome",
-            headless=True,
-            uc=True,
-            proxy=proxy_arg,
-        )
-        driver.set_page_load_timeout(60)
-        
-        # 访问主页设置 Cookie
-        print(f"[浏览器] 访问 {BASE_URL}")
-        driver.get(BASE_URL)
-        time.sleep(5)
-        
-        # 检查 CF 验证
-        if "just a moment" in driver.page_source.lower():
-            print("[浏览器] 等待 CF 验证...")
-            time.sleep(10)
-        
-        # 添加 Cookie
-        for name, value in cookies.items():
+        with SB(uc=True, headless=True, proxy=proxy_arg) as sb:
+            sb.set_page_load_timeout(60)
+            
+            # 访问主页设置 Cookie
+            print(f"[浏览器] 访问 {BASE_URL}")
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=5)
+            
+            # 处理 CF 验证
+            if sb.is_text_visible("Just a moment"):
+                print("[浏览器] 检测到 CF 验证，尝试绕过...")
+                sb.uc_gui_click_captcha()
+                time.sleep(3)
+            
+            # 添加 Cookie
+            for name, value in cookies.items():
+                try:
+                    sb.add_cookie({"name": name, "value": value, "domain": "hub.weirdhost.xyz"})
+                except:
+                    pass
+            
+            # 访问服务器页面
+            print(f"[浏览器] 访问 {server_url}")
+            sb.uc_open_with_reconnect(server_url, reconnect_time=5)
+            
+            # 处理 CF 验证
+            if sb.is_text_visible("Just a moment"):
+                print("[浏览器] 检测到 CF 验证，尝试绕过...")
+                sb.uc_gui_click_captcha()
+                time.sleep(3)
+            
+            # 检查登录状态
+            if "/login" in sb.get_current_url():
+                result["cookie_expired"] = True
+                result["message"] = "Cookie 已失效"
+                sb.save_screenshot(SCREENSHOT_PATH)
+                result["screenshot"] = SCREENSHOT_PATH
+                return result
+            
+            # 等待页面加载
+            print("[浏览器] 等待页面加载...")
+            time.sleep(5)
+            sb.save_screenshot("debug_before.png")
+            
+            # 滚动页面
+            sb.scroll_to_bottom()
+            time.sleep(2)
+            
+            # 获取到期时间
+            page_source = sb.get_page_source()
+            expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_source)
+            if expiry_match:
+                result["expiry"] = expiry_match.group(1)
+                print(f"[浏览器] 到期时间: {result['expiry']}")
+            
+            # 查找并点击续期按钮
+            print("[浏览器] 查找续期按钮...")
+            
+            # 使用 XPath 查找包含 "시간추가" 的按钮
+            button_xpath = "//button[contains(text(), '시간추가')]"
+            
+            if sb.is_element_present(button_xpath):
+                print("[浏览器] 找到续期按钮")
+                
+                # 滚动到按钮位置
+                sb.scroll_to(button_xpath)
+                time.sleep(1)
+                
+                # 使用 UC Mode 的点击方式
+                print("[浏览器] 点击续期按钮...")
+                sb.uc_click(button_xpath)
+            else:
+                result["message"] = "未找到续期按钮"
+                sb.save_screenshot(SCREENSHOT_PATH)
+                result["screenshot"] = SCREENSHOT_PATH
+                return result
+            
+            # 等待结果
+            print("[浏览器] 等待操作结果...")
+            
+            # 冷却期关键词
+            cooldown_keywords = [
+                "아직 서버를 갱신할 수 없습니다",
+                "남은 시간이 더 줄어들 때까지",
+                "갱신할 수 없습니다",
+                "기다려주세요",
+            ]
+            
+            # 成功关键词
+            success_keywords = [
+                "갱신되었습니다",
+                "연장되었습니다",
+                "추가되었습니다",
+                "시간이 추가",
+            ]
+            
+            for i in range(MAX_WAIT_API):
+                time.sleep(1)
+                
+                try:
+                    current_source = sb.get_page_source()
+                    
+                    # 优先检查冷却期
+                    for kw in cooldown_keywords:
+                        if kw in current_source:
+                            result["is_cooldown"] = True
+                            result["message"] = "冷却期内，请稍后再试"
+                            print(f"[浏览器] 检测到冷却期: '{kw}' ({i+1}秒)")
+                            break
+                    
+                    if result["is_cooldown"]:
+                        break
+                    
+                    # 检查成功
+                    for kw in success_keywords:
+                        if kw in current_source:
+                            result["success"] = True
+                            result["message"] = "续期成功"
+                            print(f"[浏览器] 检测到成功: '{kw}' ({i+1}秒)")
+                            break
+                    
+                    if result["success"]:
+                        break
+                    
+                    # 检查到期时间变化
+                    new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', current_source)
+                    if new_match:
+                        new_expiry = new_match.group(1)
+                        if result["expiry"] and new_expiry != result["expiry"]:
+                            result["success"] = True
+                            result["expiry"] = new_expiry
+                            result["message"] = "续期成功"
+                            print(f"[浏览器] 到期时间已更新: {new_expiry} ({i+1}秒)")
+                            break
+                    
+                except Exception as e:
+                    print(f"[浏览器] 检测异常: {e}")
+                
+                if i % 5 == 4:
+                    print(f"[浏览器] 等待中... ({i+1}秒)")
+            
+            # 保存截图
+            time.sleep(2)
+            sb.save_screenshot(SCREENSHOT_PATH)
+            result["screenshot"] = SCREENSHOT_PATH
+            print("[浏览器] 已保存截图")
+            
+            # 输出结果
+            if result["success"]:
+                print("[浏览器] ✓ 续期成功")
+                
+                # 刷新获取最新到期时间
+                sb.refresh()
+                time.sleep(3)
+                new_source = sb.get_page_source()
+                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_source)
+                if new_match:
+                    result["expiry"] = new_match.group(1)
+                sb.save_screenshot(SCREENSHOT_PATH)
+                
+            elif result["is_cooldown"]:
+                print("[浏览器] ⏳ 冷却期内")
+            else:
+                result["message"] = "未检测到明确结果"
+                print("[浏览器] ✗ 未检测到明确结果")
+            
+            # 获取新 Cookie
             try:
-                driver.add_cookie({"name": name, "value": value, "domain": "hub.weirdhost.xyz"})
+                for cookie in sb.get_cookies():
+                    if cookie["name"].startswith("remember_web"):
+                        new_cookie_str = f"{cookie['name']}={cookie['value']}"
+                        if new_cookie_str != cookie_str:
+                            result["new_cookie"] = new_cookie_str
+                        break
             except:
                 pass
-        
-        # 访问服务器页面
-        print(f"[浏览器] 访问 {server_url}")
-        driver.get(server_url)
-        time.sleep(5)
-        
-        # 检查 CF 验证
-        if "just a moment" in driver.page_source.lower():
-            print("[浏览器] 等待 CF 验证...")
-            time.sleep(10)
-        
-        # 检查登录状态
-        if "/login" in driver.current_url:
-            result["cookie_expired"] = True
-            result["message"] = "Cookie 已失效"
-            driver.save_screenshot(SCREENSHOT_PATH)
-            result["screenshot"] = SCREENSHOT_PATH
-            return result
-        
-        # 等待页面加载
-        print("[浏览器] 等待页面加载...")
-        time.sleep(5)
-        driver.save_screenshot("debug_before.png")
-        
-        # 滚动页面
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-        
-        # 获取到期时间
-        page_source = driver.page_source
-        expiry_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', page_source)
-        if expiry_match:
-            result["expiry"] = expiry_match.group(1)
-            print(f"[浏览器] 到期时间: {result['expiry']}")
-        
-        # 记录点击前的页面内容长度（用于检测变化）
-        before_click_len = len(page_source)
-        
-        # 查找续期按钮
-        print("[浏览器] 查找续期按钮...")
-        renew_button = None
-        
-        buttons = driver.find_elements("tag name", "button")
-        for btn in buttons:
-            try:
-                text = btn.text.strip()
-                class_attr = btn.get_attribute("class") or ""
-                if "Delete" in text or "red" in class_attr.lower():
-                    continue
-                if "시간추가" in text:
-                    renew_button = btn
-                    print(f"[浏览器] 找到按钮: {text}")
-                    break
-            except:
-                continue
-        
-        if not renew_button:
-            result["message"] = "未找到续期按钮"
-            driver.save_screenshot(SCREENSHOT_PATH)
-            result["screenshot"] = SCREENSHOT_PATH
-            return result
-        
-        # 点击续期按钮
-        print("[浏览器] 点击续期按钮...")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", renew_button)
-        time.sleep(1)
-        renew_button.click()
-        
-        # 等待结果 - 检测弹出的消息框
-        print("[浏览器] 等待操作结果...")
-        
-        # 冷却期关键词（优先检测）
-        cooldown_keywords = [
-            "아직 서버를 갱신할 수 없습니다",  # 还不能续期服务器
-            "남은 시간이 더 줄어들 때까지",     # 等待剩余时间更少
-            "갱신할 수 없습니다",              # 不能续期
-            "기다려주세요",                    # 请等待
-        ]
-        
-        # 成功关键词
-        success_keywords = [
-            "갱신되었습니다",      # 已续期
-            "연장되었습니다",      # 已延长
-            "추가되었습니다",      # 已添加
-            "시간이 추가",         # 时间已添加
-        ]
-        
-        for i in range(MAX_WAIT_API):
-            time.sleep(1)
-            
-            try:
-                current_source = driver.page_source
-                
-                # 优先检查冷却期消息（更具体的关键词）
-                for kw in cooldown_keywords:
-                    if kw in current_source:
-                        result["is_cooldown"] = True
-                        result["message"] = "冷却期内，请稍后再试"
-                        print(f"[浏览器] 检测到冷却期: '{kw}' ({i+1}秒)")
-                        break
-                
-                if result["is_cooldown"]:
-                    break
-                
-                # 检查成功消息
-                for kw in success_keywords:
-                    if kw in current_source:
-                        result["success"] = True
-                        result["message"] = "续期成功"
-                        print(f"[浏览器] 检测到成功: '{kw}' ({i+1}秒)")
-                        break
-                
-                if result["success"]:
-                    break
-                
-                # 检查到期时间是否变化
-                new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', current_source)
-                if new_match:
-                    new_expiry = new_match.group(1)
-                    if result["expiry"] and new_expiry != result["expiry"]:
-                        result["success"] = True
-                        result["expiry"] = new_expiry
-                        result["message"] = "续期成功"
-                        print(f"[浏览器] 到期时间已更新: {new_expiry} ({i+1}秒)")
-                        break
-                
-            except Exception as e:
-                print(f"[浏览器] 检测异常: {e}")
-            
-            if i % 5 == 4:
-                print(f"[浏览器] 等待中... ({i+1}秒)")
-        
-        # 保存截图
-        time.sleep(2)
-        driver.save_screenshot(SCREENSHOT_PATH)
-        result["screenshot"] = SCREENSHOT_PATH
-        print("[浏览器] 已保存截图")
-        
-        # 输出结果
-        if result["success"]:
-            print("[浏览器] ✓ 续期成功")
-            
-            # 刷新获取最新到期时间
-            driver.refresh()
-            time.sleep(3)
-            new_source = driver.page_source
-            new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_source)
-            if new_match:
-                result["expiry"] = new_match.group(1)
-            driver.save_screenshot(SCREENSHOT_PATH)
-            
-        elif result["is_cooldown"]:
-            print("[浏览器] ⏳ 冷却期内")
-        else:
-            result["message"] = "未检测到明确结果"
-            print("[浏览器] ✗ 未检测到明确结果")
-        
-        # 获取新 Cookie
-        try:
-            for cookie in driver.get_cookies():
-                if cookie["name"].startswith("remember_web"):
-                    new_cookie_str = f"{cookie['name']}={cookie['value']}"
-                    if new_cookie_str != cookie_str:
-                        result["new_cookie"] = new_cookie_str
-                    break
-        except:
-            pass
         
     except Exception as e:
         result["message"] = str(e)
         print(f"[浏览器] ✗ 异常: {e}")
         import traceback
         traceback.print_exc()
-        
-        if driver:
-            try:
-                driver.save_screenshot(SCREENSHOT_PATH)
-                result["screenshot"] = SCREENSHOT_PATH
-            except:
-                pass
-    
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
     
     return result
 
@@ -452,7 +422,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v27 (SeleniumBase + SOCKS5)")
+    print("WeirdHost 自动续期 v28 (SeleniumBase UC Mode)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
