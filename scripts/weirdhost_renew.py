@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v35
-- 修复成功判断逻辑：必须日期变化才算成功
-- 正确等待 Turnstile 验证完成
+WeirdHost 自动续期 v36
+- 修复 Turnstile 检测：检测 "Verify you are human"
+- 主动点击验证框
 """
 
 import os
@@ -142,46 +142,126 @@ def notify_telegram(message: str, photo_path: Optional[str] = None):
     send_telegram_text(message)
 
 
-def is_turnstile_verifying(sb) -> bool:
+def get_turnstile_status(sb) -> dict:
+    """获取 Turnstile 状态"""
     try:
         return sb.execute_script("""
-            if ((document.body.innerText || '').includes('Verifying')) return true;
-            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
-            var t = document.querySelector('.cf-turnstile');
-            if (t) {
-                var inp = document.querySelector('input[name="cf-turnstile-response"]');
-                if (inp && inp.value && inp.value.length > 50) return false;
-                return true;
+            var result = {exists: false, needsClick: false, verifying: false, completed: false};
+            
+            // 检查 iframe
+            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (iframe) {
+                result.exists = true;
             }
-            return false;
-        """) or False
+            
+            // 检查 turnstile 容器
+            var turnstile = document.querySelector('.cf-turnstile, [data-turnstile]');
+            if (turnstile) {
+                result.exists = true;
+            }
+            
+            // 检查文本
+            var bodyText = document.body.innerText || '';
+            if (bodyText.includes('Verify you are human')) {
+                result.exists = true;
+                result.needsClick = true;
+            }
+            if (bodyText.includes('Verifying')) {
+                result.exists = true;
+                result.verifying = true;
+            }
+            
+            // 检查是否已完成（有 response）
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input && input.value && input.value.length > 50) {
+                result.completed = true;
+                result.needsClick = false;
+                result.verifying = false;
+            }
+            
+            return result;
+        """) or {"exists": False, "needsClick": False, "verifying": False, "completed": False}
     except:
-        return False
+        return {"exists": False, "needsClick": False, "verifying": False, "completed": False}
+
+
+def click_turnstile(sb) -> bool:
+    """点击 Turnstile 验证框"""
+    try:
+        # 方法1: 使用 uc_gui_click_captcha
+        print("[Turnstile] 尝试 uc_gui_click_captcha...")
+        sb.uc_gui_click_captcha()
+        return True
+    except Exception as e:
+        print(f"[Turnstile] uc_gui_click_captcha 失败: {e}")
+    
+    try:
+        # 方法2: 直接点击 iframe
+        print("[Turnstile] 尝试点击 iframe...")
+        sb.execute_script("""
+            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (iframe) {
+                iframe.scrollIntoView({block: 'center'});
+                iframe.click();
+            }
+        """)
+        return True
+    except Exception as e:
+        print(f"[Turnstile] 点击 iframe 失败: {e}")
+    
+    try:
+        # 方法3: 点击 turnstile 容器
+        print("[Turnstile] 尝试点击容器...")
+        sb.execute_script("""
+            var t = document.querySelector('.cf-turnstile, [data-turnstile]');
+            if (t) {
+                t.scrollIntoView({block: 'center'});
+                t.click();
+            }
+        """)
+        return True
+    except:
+        pass
+    
+    return False
 
 
 def wait_for_turnstile_complete(sb, timeout: int = 120) -> bool:
-    print("[Turnstile] 等待验证完成...")
+    """等待 Turnstile 验证完成"""
+    print("[Turnstile] 开始处理验证...")
     start = time.time()
     click_count = 0
     last_click = 0
+    
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
-        if not is_turnstile_verifying(sb):
+        status = get_turnstile_status(sb)
+        
+        print(f"[Turnstile] {elapsed}秒 - exists:{status['exists']} needsClick:{status['needsClick']} verifying:{status['verifying']} completed:{status['completed']}")
+        
+        # 已完成
+        if status['completed']:
             print(f"[Turnstile] ✓ 验证完成 ({elapsed}秒)")
             return True
-        if time.time() - last_click > 15 and click_count < 5:
-            print(f"[Turnstile] {elapsed}秒 - 尝试点击...")
-            try:
-                sb.uc_gui_click_captcha()
-                click_count += 1
-                last_click = time.time()
-            except:
-                pass
-            time.sleep(3)
-        else:
-            if elapsed % 10 == 0:
-                print(f"[Turnstile] {elapsed}秒 - 仍在验证...")
+        
+        # 不存在 turnstile
+        if not status['exists']:
             time.sleep(2)
+            status = get_turnstile_status(sb)
+            if not status['exists']:
+                print(f"[Turnstile] ✓ 无需验证 ({elapsed}秒)")
+                return True
+        
+        # 需要点击或正在验证，尝试点击
+        if (status['needsClick'] or status['verifying']) and time.time() - last_click > 10 and click_count < 8:
+            print(f"[Turnstile] 尝试点击 (第{click_count + 1}次)...")
+            click_turnstile(sb)
+            click_count += 1
+            last_click = time.time()
+            time.sleep(5)
+        else:
+            time.sleep(2)
+    
     print(f"[Turnstile] ✗ 超时 ({timeout}秒)")
     return False
 
@@ -280,6 +360,7 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 result["expiry"] = original_expiry
                 print(f"[浏览器] 当前到期: {original_expiry}")
             
+            # 点击续期按钮
             btn_result = sb.execute_script("""
                 var btns = document.querySelectorAll('button');
                 for (var i = 0; i < btns.length; i++) {
@@ -303,7 +384,9 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             time.sleep(3)
             screenshot(sb, "03-after-click")
             
-            if is_turnstile_verifying(sb):
+            # 检查并处理 Turnstile
+            status = get_turnstile_status(sb)
+            if status['exists'] or status['needsClick'] or status['verifying']:
                 print("[浏览器] 检测到 Turnstile...")
                 if not wait_for_turnstile_complete(sb, 120):
                     result["message"] = "Turnstile 超时"
@@ -311,19 +394,27 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                     result["screenshot"] = SCREENSHOT_PATH
                     return result
                 screenshot(sb, "04-turnstile-done")
+                time.sleep(3)
             
+            # 等待结果
             print("[浏览器] 等待结果...")
             for i in range(60):
                 time.sleep(1)
-                if is_turnstile_verifying(sb):
+                
+                # 检查 Turnstile 状态
+                status = get_turnstile_status(sb)
+                if status['exists'] and not status['completed']:
                     if i % 10 == 0:
-                        print(f"[浏览器] {i}秒 - Turnstile 验证中...")
+                        print(f"[浏览器] {i}秒 - Turnstile 未完成，尝试点击...")
+                        click_turnstile(sb)
                     continue
+                
                 if check_cooldown_message(sb):
                     result["is_cooldown"] = True
                     result["message"] = "冷却期内"
                     print("[浏览器] ⏳ 冷却期")
                     break
+                
                 new_expiry = get_expiry_from_page(sb)
                 if new_expiry and original_expiry and new_expiry != original_expiry:
                     result["success"] = True
@@ -331,8 +422,10 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                     result["message"] = "续期成功"
                     print(f"[浏览器] ✓ 日期更新: {original_expiry} -> {new_expiry}")
                     break
+                
                 if i % 15 == 14:
                     print(f"[浏览器] {i+1}秒 - 等待中...")
+                    screenshot(sb, f"05-waiting-{i+1}s")
             
             time.sleep(2)
             screenshot(sb, "debug_result")
@@ -375,7 +468,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v35")
+    print("WeirdHost 自动续期 v36")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"代理: {socks_proxy or '无'}")
