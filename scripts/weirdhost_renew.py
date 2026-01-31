@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v30
-- 修复按钮选择器
+WeirdHost 自动续期 v31
+- 修复 f-string 语法错误
 """
 
 import os
 import sys
 import json
-import time
 import re
 import urllib.parse
 import urllib.request
@@ -277,119 +276,69 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 result["expiry"] = expiry_match.group(1)
                 print(f"[浏览器] 到期时间: {result['expiry']}")
             
-            # 查找续期按钮 - 多种选择器
+            # 查找续期按钮 - 使用 JavaScript
             print("[浏览器] 查找续期按钮...")
             
-            # 按钮选择器列表（按优先级）
-            button_selectors = [
-                # 包含 "시간추가" 文字的按钮
-                "button:contains('시간추가')",
-                # 包含 "시간" 文字的按钮
-                "button:contains('시간')",
-                # 红色/警告色按钮（通常是续期按钮）
-                "button.bg-red-500",
-                "button.bg-red-600",
-                "button[class*='red']",
-                "button[class*='danger']",
-                "button[class*='warning']",
-                # 通过 XPath
-                "xpath://button[contains(text(), '시간추가')]",
-                "xpath://button[contains(text(), '시간')]",
-                "xpath://button[contains(., '시간추가')]",
-                "xpath://button[contains(., '시간')]",
-                # 通过按钮样式
-                "xpath://button[contains(@class, 'red')]",
-            ]
-            
-            button_found = False
-            used_selector = None
-            
-            for selector in button_selectors:
-                try:
-                    if selector.startswith("xpath:"):
-                        xpath = selector[6:]
-                        if sb.is_element_present(xpath):
-                            used_selector = xpath
-                            button_found = True
-                            print(f"[浏览器] 找到按钮 (XPath): {xpath}")
-                            break
-                    else:
-                        if sb.is_element_present(selector):
-                            used_selector = selector
-                            button_found = True
-                            print(f"[浏览器] 找到按钮 (CSS): {selector}")
-                            break
-                except Exception as e:
-                    continue
-            
-            # 如果还没找到，用 JavaScript 查找
-            if not button_found:
-                print("[浏览器] 尝试 JavaScript 查找按钮...")
-                js_find = """
-                var buttons = document.querySelectorAll('button');
-                for (var i = 0; i < buttons.length; i++) {
-                    var text = buttons[i].innerText || buttons[i].textContent;
-                    if (text.includes('시간') || text.includes('추가') || text.includes('갱신')) {
-                        return i;
-                    }
+            # JavaScript 查找包含特定文字的按钮
+            js_find_button = """
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = buttons[i].innerText || buttons[i].textContent;
+                if (text.includes('시간추가') || text.includes('시간 추가')) {
+                    return i;
                 }
-                return -1;
-                """
-                btn_index = sb.execute_script(js_find)
-                if btn_index >= 0:
-                    button_found = True
-                    used_selector = f"js_index:{btn_index}"
-                    print(f"[浏览器] 找到按钮 (JS index): {btn_index}")
+            }
+            // 备用：查找包含 "시간" 的按钮
+            for (var i = 0; i < buttons.length; i++) {
+                var text = buttons[i].innerText || buttons[i].textContent;
+                if (text.includes('시간')) {
+                    return i;
+                }
+            }
+            return -1;
+            """
             
-            if not button_found:
+            btn_index = sb.execute_script(js_find_button)
+            
+            if btn_index < 0:
                 # 输出页面上所有按钮的文字用于调试
-                all_buttons = sb.execute_script("""
+                js_list_buttons = """
                 var buttons = document.querySelectorAll('button');
                 var texts = [];
                 for (var i = 0; i < buttons.length; i++) {
-                    texts.push(i + ': ' + (buttons[i].innerText || buttons[i].textContent).trim().substring(0, 50));
+                    var text = (buttons[i].innerText || buttons[i].textContent).trim();
+                    if (text) texts.push(i + ': ' + text.substring(0, 50));
                 }
-                return texts.join('\\n');
-                """)
-                print(f"[浏览器] 页面上的按钮:\n{all_buttons}")
+                return texts.join(' | ');
+                """
+                all_buttons = sb.execute_script(js_list_buttons)
+                print(f"[浏览器] 页面上的按钮: {all_buttons}")
                 
                 result["message"] = "未找到续期按钮"
                 sb.save_screenshot(SCREENSHOT_PATH)
                 result["screenshot"] = SCREENSHOT_PATH
                 return result
             
-            # 点击按钮
+            print(f"[浏览器] 找到按钮 (index: {btn_index})")
+            
+            # 滚动到按钮并点击
             print("[浏览器] 点击续期按钮...")
-            try:
-                if used_selector.startswith("js_index:"):
-                    idx = int(used_selector.split(":")[1])
-                    sb.execute_script(f"""
-                    var buttons = document.querySelectorAll('button');
-                    buttons[{idx}].scrollIntoView({{block: 'center'}});
-                    """)
-                    sb.sleep(0.5)
-                    sb.execute_script(f"""
-                    var buttons = document.querySelectorAll('button');
-                    buttons[{idx}].click();
-                    """)
-                else:
-                    # 滚动到按钮
-                    sb.execute_script(f"""
-                    var el = document.querySelector("{used_selector.replace('"', '\\"')}");
-                    if (el) el.scrollIntoView({{block: 'center'}});
-                    """)
-                    sb.sleep(0.5)
-                    sb.uc_click(used_selector)
-            except Exception as e:
-                print(f"[浏览器] uc_click 失败: {e}，尝试普通点击")
-                try:
-                    sb.click(used_selector)
-                except Exception as e2:
-                    print(f"[浏览器] 普通点击也失败: {e2}，尝试 JS 点击")
-                    sb.execute_script(f"""
-                    var el = document.querySelector("{used_selector.replace('"', '\\"')}");
-                    if (el) el.click();
-                    """)
+            js_scroll_click = """
+            var buttons = document.querySelectorAll('button');
+            var btn = buttons[arguments[0]];
+            btn.scrollIntoView({block: 'center'});
+            return true;
+            """
+            sb.execute_script(js_scroll_click, btn_index)
+            sb.sleep(0.5)
+            
+            js_click = """
+            var buttons = document.querySelectorAll('button');
+            var btn = buttons[arguments[0]];
+            btn.click();
+            return true;
+            """
+            sb.execute_script(js_click, btn_index)
             
             # 等待结果
             print("[浏览器] 等待操作结果...")
@@ -473,7 +422,7 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             try:
                 for cookie in sb.get_cookies():
                     if cookie["name"].startswith("remember_web"):
-                        new_cookie_str = f"{cookie['name']}={cookie['value']}"
+                        new_cookie_str = cookie["name"] + "=" + cookie["value"]
                         if new_cookie_str != cookie_str:
                             result["new_cookie"] = new_cookie_str
                         break
@@ -501,7 +450,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v30 (SeleniumBase UC Mode)")
+    print("WeirdHost 自动续期 v31 (SeleniumBase UC Mode)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
