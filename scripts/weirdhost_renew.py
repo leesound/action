@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WeirdHost 自动续期 v28
-- SeleniumBase UC Mode (操作系统级鼠标模拟)
+WeirdHost 自动续期 v29
+- 修复 SeleniumBase UC Mode API
 """
 
 import os
@@ -222,21 +222,21 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
         print(f"[浏览器] 使用 SOCKS5 代理: {proxy_addr}")
     
     try:
-        # 使用 SeleniumBase UC Mode
         print("[浏览器] 启动 Chrome (UC Mode)...")
         
         with SB(uc=True, headless=True, proxy=proxy_arg) as sb:
-            sb.set_page_load_timeout(60)
-            
             # 访问主页设置 Cookie
             print(f"[浏览器] 访问 {BASE_URL}")
             sb.uc_open_with_reconnect(BASE_URL, reconnect_time=5)
             
             # 处理 CF 验证
-            if sb.is_text_visible("Just a moment"):
-                print("[浏览器] 检测到 CF 验证，尝试绕过...")
-                sb.uc_gui_click_captcha()
-                time.sleep(3)
+            try:
+                if sb.is_text_visible("Just a moment", timeout=3):
+                    print("[浏览器] 检测到 CF 验证，尝试绕过...")
+                    sb.uc_gui_click_captcha()
+                    sb.sleep(3)
+            except:
+                pass
             
             # 添加 Cookie
             for name, value in cookies.items():
@@ -250,10 +250,13 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             
             # 处理 CF 验证
-            if sb.is_text_visible("Just a moment"):
-                print("[浏览器] 检测到 CF 验证，尝试绕过...")
-                sb.uc_gui_click_captcha()
-                time.sleep(3)
+            try:
+                if sb.is_text_visible("Just a moment", timeout=3):
+                    print("[浏览器] 检测到 CF 验证，尝试绕过...")
+                    sb.uc_gui_click_captcha()
+                    sb.sleep(3)
+            except:
+                pass
             
             # 检查登录状态
             if "/login" in sb.get_current_url():
@@ -265,12 +268,12 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             
             # 等待页面加载
             print("[浏览器] 等待页面加载...")
-            time.sleep(5)
+            sb.sleep(5)
             sb.save_screenshot("debug_before.png")
             
             # 滚动页面
-            sb.scroll_to_bottom()
-            time.sleep(2)
+            sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+            sb.sleep(2)
             
             # 获取到期时间
             page_source = sb.get_page_source()
@@ -279,32 +282,43 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 result["expiry"] = expiry_match.group(1)
                 print(f"[浏览器] 到期时间: {result['expiry']}")
             
-            # 查找并点击续期按钮
+            # 查找续期按钮
             print("[浏览器] 查找续期按钮...")
-            
-            # 使用 XPath 查找包含 "시간추가" 的按钮
             button_xpath = "//button[contains(text(), '시간추가')]"
             
-            if sb.is_element_present(button_xpath):
-                print("[浏览器] 找到续期按钮")
-                
-                # 滚动到按钮位置
-                sb.scroll_to(button_xpath)
-                time.sleep(1)
-                
-                # 使用 UC Mode 的点击方式
-                print("[浏览器] 点击续期按钮...")
-                sb.uc_click(button_xpath)
-            else:
-                result["message"] = "未找到续期按钮"
-                sb.save_screenshot(SCREENSHOT_PATH)
-                result["screenshot"] = SCREENSHOT_PATH
-                return result
+            try:
+                if sb.is_element_present(button_xpath):
+                    print("[浏览器] 找到续期按钮")
+                    
+                    # 滚动到按钮
+                    sb.execute_script(
+                        "document.evaluate(arguments[0], document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue.scrollIntoView({block: 'center'});",
+                        button_xpath
+                    )
+                    sb.sleep(1)
+                    
+                    # 点击按钮
+                    print("[浏览器] 点击续期按钮...")
+                    sb.uc_click(button_xpath)
+                else:
+                    result["message"] = "未找到续期按钮"
+                    sb.save_screenshot(SCREENSHOT_PATH)
+                    result["screenshot"] = SCREENSHOT_PATH
+                    return result
+            except Exception as e:
+                print(f"[浏览器] 按钮操作异常: {e}")
+                # 尝试备用方法
+                try:
+                    sb.click(button_xpath)
+                except:
+                    result["message"] = f"点击按钮失败: {e}"
+                    sb.save_screenshot(SCREENSHOT_PATH)
+                    result["screenshot"] = SCREENSHOT_PATH
+                    return result
             
             # 等待结果
             print("[浏览器] 等待操作结果...")
             
-            # 冷却期关键词
             cooldown_keywords = [
                 "아직 서버를 갱신할 수 없습니다",
                 "남은 시간이 더 줄어들 때까지",
@@ -312,7 +326,6 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                 "기다려주세요",
             ]
             
-            # 成功关键词
             success_keywords = [
                 "갱신되었습니다",
                 "연장되었습니다",
@@ -321,7 +334,7 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
             ]
             
             for i in range(MAX_WAIT_API):
-                time.sleep(1)
+                sb.sleep(1)
                 
                 try:
                     current_source = sb.get_page_source()
@@ -366,24 +379,20 @@ def run_browser_renew(cookie_str: str, server_id: str, socks_proxy: Optional[str
                     print(f"[浏览器] 等待中... ({i+1}秒)")
             
             # 保存截图
-            time.sleep(2)
+            sb.sleep(2)
             sb.save_screenshot(SCREENSHOT_PATH)
             result["screenshot"] = SCREENSHOT_PATH
             print("[浏览器] 已保存截图")
             
-            # 输出结果
             if result["success"]:
                 print("[浏览器] ✓ 续期成功")
-                
-                # 刷新获取最新到期时间
                 sb.refresh()
-                time.sleep(3)
+                sb.sleep(3)
                 new_source = sb.get_page_source()
                 new_match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})', new_source)
                 if new_match:
                     result["expiry"] = new_match.group(1)
                 sb.save_screenshot(SCREENSHOT_PATH)
-                
             elif result["is_cooldown"]:
                 print("[浏览器] ⏳ 冷却期内")
             else:
@@ -422,7 +431,7 @@ def main():
         sys.exit(1)
     
     print("=" * 50)
-    print("WeirdHost 自动续期 v28 (SeleniumBase UC Mode)")
+    print("WeirdHost 自动续期 v29 (SeleniumBase UC Mode)")
     print("=" * 50)
     print(f"服务器 ID: {server_id}")
     print(f"SOCKS5 代理: {socks_proxy if socks_proxy else '无'}")
@@ -431,7 +440,6 @@ def main():
     
     result = run_browser_renew(cookie, server_id, socks_proxy if socks_proxy else None)
     
-    # 更新 Cookie
     if result.get("new_cookie"):
         update_github_secret("WEIRDHOST_COOKIE", result["new_cookie"])
     
