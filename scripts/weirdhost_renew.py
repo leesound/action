@@ -1,17 +1,3 @@
-你说得对！从截图看：
-
-1. **03-after-click.png** - 显示 "Verifying..." Turnstile 还在验证中
-2. **debug_result.png** - 日期仍然是 `2026-02-13 00:06:57`，没有变化！
-
-问题是脚本误判成功了。原因是 `success_keywords` 检测到了页面上的某些韩文文本（可能是其他地方的文字），但实际上续期并没有完成。
-
-需要修复判断逻辑：**必须等待 Turnstile 完成后，再检查日期是否变化**。
-
----
-
-## 修复版 `scripts/weirdhost_renew.py`
-
-```python
 #!/usr/bin/env python3
 """
 WeirdHost 自动续期 v35
