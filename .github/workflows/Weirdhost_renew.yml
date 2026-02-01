@@ -1,134 +1,48 @@
-name: WeirdHost 自动续期
-
+name: Weirdhost 续订
 on:
   schedule:
-    - cron: '05 4 * * *'
-  workflow_dispatch:
+    - cron: '15 16 * * *'  # 每天北京时间 00:15 运行
+  workflow_dispatch:      # 支持手动触发
 
 jobs:
-  renew:
+  add_time:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
-
+    timeout-minutes: 15
     steps:
-      - name: 检出代码
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk xvfb
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      
-      - name: 安装 Python 依赖
-        run: |
-          pip install playwright pynacl
-          playwright install chromium
-          playwright install-deps chromium
-      
-      - name: 下载 Hysteria2
-        run: |
-          wget -q https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -O hysteria
-          chmod +x hysteria
+          python-version: "3.11"
 
-      - name: 配置并启动代理
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright aiohttp pynacl
+          playwright install --with-deps chromium
+
+      - name: Run weirdhost-auto
         env:
-          HY2_URL: ${{ secrets.HY2_URL }}
-        run: |
-          if [ -z "$HY2_URL" ]; then
-            echo "⚠️ HY2_URL 未设置，跳过代理"
-            exit 0
-          fi
-          
-          URL_BODY="${HY2_URL#hysteria2://}"
-          URL_BODY="${URL_BODY%%#*}"
-          PASSWORD="${URL_BODY%%@*}"
-          SERVER_PART="${URL_BODY#*@}"
-          SERVER="${SERVER_PART%%\?*}"
-          PARAMS="${SERVER_PART#*\?}"
-          
-          get_param() { echo "$PARAMS" | tr '&' '\n' | grep "^$1=" | cut -d'=' -f2; }
-          
-          SNI=$(get_param "sni")
-          INSECURE=$(get_param "insecure")
-          
-          [ -z "$SNI" ] && SNI="${SERVER%%:*}"
-          [ "$INSECURE" = "1" ] && INSECURE="true" || INSECURE="false"
-          
-          cat > hy2-config.yaml << EOF
-          server: ${SERVER}
-          auth: ${PASSWORD}
-          tls:
-            sni: ${SNI}
-            insecure: ${INSECURE}
-          socks5:
-            listen: 127.0.0.1:1080
-          EOF
-          
-          ./hysteria client -c hy2-config.yaml > hysteria.log 2>&1 &
-          sleep 3
-
-          if curl -s --proxy socks5://127.0.0.1:1080 --max-time 10 https://httpbin.org/ip > /dev/null 2>&1; then
-            echo "✅ SOCKS5 代理已启动"
-            echo "SOCKS_PROXY=socks5://127.0.0.1:1080" >> $GITHUB_ENV
-          else
-            echo "⚠️ 代理可能不可用"
-            cat hysteria.log || true
-          fi
-
-      - name: 启动虚拟显示器
-        run: |
-          Xvfb :99 -screen 0 1920x1080x24 &
-          sleep 2
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-
-      - name: 运行续期脚本
-        env:
+          # Cookie 登录 (格式: cookie_name=cookie_value)
           WEIRDHOST_COOKIE: ${{ secrets.WEIRDHOST_COOKIE }}
-          REMEMBER_WEB_COOKIE: ${{ secrets.REMEMBER_WEB_COOKIE }}
+          # 目标服务器 ID
           WEIRDHOST_ID: ${{ secrets.WEIRDHOST_ID }}
-          WEIRDHOST_SERVER_URLS: ${{ secrets.WEIRDHOST_SERVER_URLS }}
-          WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
-          WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
+          # Telegram 通知
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 自动更新 Cookie 到 Secrets
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
-          DISPLAY: ":99"
-          HEADLESS: "false"
-        run: python scripts/weirdhost_renew.py
-
-      - name: 提交 README
-        if: always()
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md || true
-          if ! git diff --cached --quiet; then
-            git commit -m "📝 更新运行状态: $(date +'%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD:main
-          fi
+          python scripts/weirdhost_renew.py
 
-      - name: 上传调试截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: "*.png"
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: 清理旧运行
-        if: always()
+      - name: 清理工作流记录
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          delete_workflow_pattern: WeirdHost 自动续期
+          delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
           keep_minimum_runs: 3
