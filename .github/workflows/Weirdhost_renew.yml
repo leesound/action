@@ -19,7 +19,7 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk xvfb x11-utils
+          sudo apt-get install -y fonts-noto-cjk xvfb
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -91,12 +91,28 @@ jobs:
       - name: 运行续期脚本
         env:
           WEIRDHOST_COOKIE: ${{ secrets.WEIRDHOST_COOKIE }}
+          REMEMBER_WEB_COOKIE: ${{ secrets.REMEMBER_WEB_COOKIE }}
           WEIRDHOST_ID: ${{ secrets.WEIRDHOST_ID }}
+          WEIRDHOST_SERVER_URLS: ${{ secrets.WEIRDHOST_SERVER_URLS }}
+          WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
+          WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
           DISPLAY: ":99"
+          HEADLESS: "false"
         run: python scripts/weirdhost_renew.py
+
+      - name: 提交 README
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md || true
+          if ! git diff --cached --quiet; then
+            git commit -m "📝 更新运行状态: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:main
+          fi
 
       - name: 上传调试截图
         if: always()
