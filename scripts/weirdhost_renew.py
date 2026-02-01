@@ -1,546 +1,456 @@
 #!/usr/bin/env python3
-"""
-WeirdHost 自动续期 - Playwright 版本
-支持 Cookie 认证和邮箱密码认证
-"""
+# -*- coding: utf-8 -*-
 
 import os
-import sys
-import time
-import json
-import urllib.request
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict
-from base64 import b64encode, b64decode
+import asyncio
+import aiohttp
+import base64
+from datetime import datetime
+from playwright.async_api import async_playwright
+from urllib.parse import unquote
 
-BASE_URL = "https://hub.weirdhost.xyz"
+try:
+    from nacl import encoding, public
+    NACL_AVAILABLE = True
+except ImportError:
+    NACL_AVAILABLE = False
+
+BASE_URL = "https://hub.weirdhost.xyz/server/"
 
 
-class WeirdhostRenew:
-    def __init__(self):
-        # 认证信息
-        self.cookie = os.getenv('WEIRDHOST_COOKIE', '') or os.getenv('REMEMBER_WEB_COOKIE', '')
-        self.email = os.getenv('WEIRDHOST_EMAIL', '')
-        self.password = os.getenv('WEIRDHOST_PASSWORD', '')
-        
-        # 服务器配置
-        server_urls = os.getenv('WEIRDHOST_SERVER_URLS', '')
-        server_id = os.getenv('WEIRDHOST_ID', '')
-        
-        self.server_list = []
-        if server_urls:
-            self.server_list = [url.strip() for url in server_urls.split(',') if url.strip()]
-        elif server_id:
-            self.server_list = [f"{BASE_URL}/server/{server_id}"]
-        
-        # 代理配置
-        self.socks_proxy = os.getenv('SOCKS_PROXY', '')
-        
-        # 通知配置
-        self.tg_token = os.getenv('TG_BOT_TOKEN', '')
-        self.tg_chat_id = os.getenv('TG_CHAT_ID', '')
-        
-        # 浏览器配置
-        self.headless = os.getenv('HEADLESS', 'false').lower() == 'true'
+def parse_weirdhost_cookie(cookie_str: str) -> tuple:
+    if not cookie_str:
+        return (None, None)
     
-    def log(self, msg: str, level: str = "INFO"):
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[{timestamp}] [{level}] {msg}")
+    cookie_str = cookie_str.strip()
     
-    def has_cookie_auth(self) -> bool:
-        return bool(self.cookie)
-    
-    def has_email_auth(self) -> bool:
-        return bool(self.email and self.password)
-    
-    def send_telegram(self, message: str, photo_path: Optional[str] = None) -> bool:
-        if not self.tg_token or not self.tg_chat_id:
-            return False
-        try:
-            if photo_path and os.path.exists(photo_path):
-                url = f"https://api.telegram.org/bot{self.tg_token}/sendPhoto"
-                boundary = "----FormBoundary7MA4YWxk"
-                with open(photo_path, "rb") as f:
-                    photo_data = f.read()
-                body = b"\r\n".join([
-                    f"--{boundary}".encode(), b'Content-Disposition: form-data; name="chat_id"', b"", self.tg_chat_id.encode(),
-                    f"--{boundary}".encode(), b'Content-Disposition: form-data; name="caption"', b"", message.encode('utf-8'),
-                    f"--{boundary}".encode(), b'Content-Disposition: form-data; name="parse_mode"', b"", b"HTML",
-                    f"--{boundary}".encode(), b'Content-Disposition: form-data; name="photo"; filename="screenshot.png"',
-                    b"Content-Type: image/png", b"", photo_data, f"--{boundary}--".encode(), b""
-                ])
-                req = urllib.request.Request(url, data=body, method="POST")
-                req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-            else:
-                url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-                data = json.dumps({"chat_id": self.tg_chat_id, "text": message, "parse_mode": "HTML"}).encode('utf-8')
-                req = urllib.request.Request(url, data=data, method="POST")
-                req.add_header("Content-Type", "application/json")
-            urllib.request.urlopen(req, timeout=30)
-            self.log("✓ Telegram 通知已发送")
-            return True
-        except Exception as e:
-            self.log(f"✗ Telegram 发送失败: {e}", "ERROR")
-            return False
-    
-    def update_github_secret(self, secret_name: str, secret_value: str) -> bool:
-        token = os.environ.get("REPO_TOKEN", "").strip()
-        repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-        if not token or not repo:
-            return False
-        try:
-            key_url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
-            req = urllib.request.Request(key_url)
-            req.add_header("Authorization", f"token {token}")
-            req.add_header("Accept", "application/vnd.github.v3+json")
-            req.add_header("User-Agent", "WeirdHost-Renew")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                key_data = json.loads(resp.read().decode('utf-8'))
-            from nacl import encoding, public
-            public_key_bytes = b64decode(key_data["key"])
-            sealed_box = public.SealedBox(public.PublicKey(public_key_bytes))
-            encrypted = sealed_box.encrypt(secret_value.encode('utf-8'))
-            encrypted_value = b64encode(encrypted).decode('utf-8')
-            secret_url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
-            data = json.dumps({"encrypted_value": encrypted_value, "key_id": key_data["key_id"]}).encode('utf-8')
-            req = urllib.request.Request(secret_url, data=data, method="PUT")
-            req.add_header("Authorization", f"token {token}")
-            req.add_header("Accept", "application/vnd.github.v3+json")
-            req.add_header("Content-Type", "application/json")
-            req.add_header("User-Agent", "WeirdHost-Renew")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                if resp.status in (201, 204):
-                    self.log("✓ GitHub Secret 已更新")
-                    return True
-            return False
-        except Exception as e:
-            self.log(f"✗ GitHub Secret 更新失败: {e}", "ERROR")
-            return False
-    
-    def parse_cookie_for_playwright(self) -> list:
-        """解析 cookie 为 Playwright 格式"""
-        import urllib.parse
-        cookie_str = urllib.parse.unquote(self.cookie.strip())
-        cookies = []
-        
-        # 检查是否是完整的 cookie 字符串 (name=value 格式)
-        if '=' in cookie_str and not cookie_str.startswith('remember_web'):
-            # 可能是多个 cookie
-            for part in cookie_str.split(";"):
-                if "=" in part:
-                    k, v = part.strip().split("=", 1)
-                    cookies.append({
-                        "name": k.strip(),
-                        "value": v.strip(),
-                        "domain": "hub.weirdhost.xyz",
-                        "path": "/",
-                        "httpOnly": True,
-                        "secure": True,
-                        "sameSite": "Lax"
-                    })
-        else:
-            # 只有 value，需要添加标准的 cookie name
-            value = cookie_str.split('=')[-1] if '=' in cookie_str else cookie_str
-            cookies.append({
-                "name": "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d",
-                "value": value,
-                "domain": "hub.weirdhost.xyz",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax"
-            })
-        
-        return cookies
-    
-    def check_login_status(self, page) -> bool:
-        """检查是否已登录"""
-        try:
-            if "login" in page.url or "auth" in page.url:
-                return False
-            return True
-        except:
-            return False
-    
-    def handle_turnstile(self, page, timeout: int = 120) -> bool:
-        """处理 Turnstile 验证"""
-        self.log("检查 Turnstile 验证...")
-        start = time.time()
-        click_count = 0
-        
-        while time.time() - start < timeout:
-            elapsed = int(time.time() - start)
+    # 尝试按 = 分割
+    if "=" in cookie_str:
+        parts = cookie_str.split("=", 1)
+        if len(parts) == 2:
+            name = parts[0].strip()
+            value = parts[1].strip()
+            # URL 解码 value（如果有 %3D 等编码）
             try:
-                content = page.content()
-                has_verify = "Verify you are human" in content or "Verifying" in content
-                
-                # 检查验证是否完成
-                response = page.evaluate("""() => {
-                    var inp = document.querySelector('input[name="cf-turnstile-response"]');
-                    return inp && inp.value && inp.value.length > 50;
-                }""")
-                
-                if response:
-                    self.log(f"✓ Turnstile 验证完成 ({elapsed}秒)")
-                    return True
-                
-                if not has_verify:
-                    time.sleep(2)
-                    content = page.content()
-                    if "Verify you are human" not in content and "Verifying" not in content:
-                        self.log(f"✓ 无需 Turnstile 验证 ({elapsed}秒)")
-                        return True
-                
-                # 尝试点击验证框
-                if click_count < 10 and (click_count == 0 or elapsed % 10 == 0):
-                    self.log(f"[{elapsed}秒] 尝试点击验证框...")
-                    try:
-                        iframe = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-                        checkbox = iframe.locator('input[type="checkbox"], .cb-i')
-                        if checkbox.count() > 0:
-                            checkbox.first.click(timeout=5000)
-                            click_count += 1
-                            time.sleep(3)
-                            continue
-                    except:
-                        pass
-                    try:
-                        turnstile = page.locator('.cf-turnstile, [data-turnstile]')
-                        if turnstile.count() > 0:
-                            turnstile.first.click(timeout=5000)
-                            click_count += 1
-                            time.sleep(3)
-                            continue
-                    except:
-                        pass
-                
-                if elapsed % 15 == 0 and elapsed > 0:
-                    self.log(f"[{elapsed}秒] 等待验证中...")
-                time.sleep(2)
-            except Exception as e:
-                if elapsed % 20 == 0:
-                    self.log(f"[{elapsed}秒] 异常: {e}", "WARNING")
-                time.sleep(2)
-        
-        self.log(f"✗ Turnstile 验证超时 ({timeout}秒)", "ERROR")
-        return False
-    
-    def find_renew_button(self, page, server_id: str):
-        """查找续期按钮"""
-        selectors = [
-            'button:has-text("시간추가")',
-            'button:has-text("시간 추가")',
-            '//button[contains(text(), "시간추가")]',
-            '//button[contains(text(), "시간 추가")]',
-        ]
-        
-        for selector in selectors:
-            try:
-                if selector.startswith('//'):
-                    button = page.locator(f'xpath={selector}')
-                else:
-                    button = page.locator(selector)
-                
-                if button.count() > 0 and button.first.is_visible():
-                    self.log(f"✓ 服务器 {server_id} 找到按钮")
-                    return button.first
-            except:
-                continue
-        
-        # 备用方法：遍历所有按钮
-        try:
-            all_buttons = page.locator('button')
-            for i in range(all_buttons.count()):
-                try:
-                    button = all_buttons.nth(i)
-                    if button.is_visible():
-                        text = button.text_content().strip()
-                        if "시간" in text:
-                            self.log(f"✓ 服务器 {server_id} 通过文本搜索找到按钮: '{text}'")
-                            return button
-                except:
-                    continue
-        except:
-            pass
-        
-        self.log(f"✗ 服务器 {server_id} 未找到续期按钮", "ERROR")
-        return None
-    
-    def process_server(self, page, context, server_url: str) -> Dict:
-        """处理单个服务器的续期"""
-        server_id = server_url.rstrip('/').split('/')[-1]
-        result = {
-            "server_id": server_id,
-            "success": False,
-            "status": "unknown",
-            "message": ""
-        }
-        
-        try:
-            self.log(f"访问服务器页面: {server_url}")
-            page.goto(server_url, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
-            
-            # 检查登录状态
-            if not self.check_login_status(page):
-                result["status"] = "login_failed"
-                result["message"] = "未登录或登录已失效"
-                return result
-            
-            # 截图
-            page.screenshot(path=f"server_{server_id}.png")
-            
-            # 查找续期按钮
-            button = self.find_renew_button(page, server_id)
-            if not button:
-                result["status"] = "no_button"
-                result["message"] = "未找到续期按钮"
-                return result
-            
-            # 检查按钮是否可用
-            if not button.is_enabled():
-                result["status"] = "button_disabled"
-                result["message"] = "续期按钮不可点击"
-                return result
-            
-            # 保存点击前的页面内容
-            before_content = page.content()
-            
-            # 点击按钮
-            self.log(f"点击续期按钮...")
-            button.scroll_into_view_if_needed()
-            time.sleep(1)
-            button.click()
-            time.sleep(3)
-            
-            # 截图
-            page.screenshot(path=f"after_click_{server_id}.png")
-            
-            # 检查是否需要 Turnstile 验证
-            content = page.content()
-            if "Verify you are human" in content or "Verifying" in content or page.locator('.cf-turnstile').count() > 0:
-                self.log("检测到 Turnstile 验证...")
-                if not self.handle_turnstile(page, 120):
-                    result["status"] = "turnstile_failed"
-                    result["message"] = "Turnstile 验证失败"
-                    return result
-            
-            # 等待结果
-            time.sleep(5)
-            after_content = page.content()
-            
-            # 检查结果
-            cooldown_keywords = ["아직 서버를 갱신할 수 없습니다", "갱신할 수 없습니다", "기다려주세요", "already", "can't renew", "이미", "한번"]
-            success_keywords = ["success", "성공", "added", "추가됨", "갱신되었습니다"]
-            
-            for kw in cooldown_keywords:
-                if kw.lower() in after_content.lower():
-                    result["status"] = "cooldown"
-                    result["message"] = "冷却期内，已续期过"
-                    result["success"] = True  # 冷却期也算成功
-                    return result
-            
-            for kw in success_keywords:
-                if kw.lower() in after_content.lower():
-                    result["status"] = "success"
-                    result["message"] = "续期成功"
-                    result["success"] = True
-                    return result
-            
-            # 检查页面是否变化
-            if before_content != after_content:
-                result["status"] = "changed"
-                result["message"] = "页面已变化，可能成功"
-                result["success"] = True
-            else:
-                result["status"] = "no_change"
-                result["message"] = "页面无变化"
-            
-            return result
-            
-        except Exception as e:
-            self.log(f"处理服务器 {server_id} 出错: {e}", "ERROR")
-            result["status"] = "error"
-            result["message"] = str(e)
-            return result
-    
-    def run(self) -> List[Dict]:
-        """主运行函数"""
-        from playwright.sync_api import sync_playwright
-        
-        self.log("=" * 50)
-        self.log("WeirdHost 自动续期")
-        self.log("=" * 50)
-        
-        if not self.has_cookie_auth() and not self.has_email_auth():
-            self.log("没有可用的认证信息！", "ERROR")
-            return [{"server_id": "N/A", "success": False, "status": "no_auth", "message": "无认证信息"}]
-        
-        if not self.server_list:
-            self.log("未设置服务器列表！", "ERROR")
-            return [{"server_id": "N/A", "success": False, "status": "no_servers", "message": "无服务器配置"}]
-        
-        self.log(f"Cookie 认证: {'✓' if self.has_cookie_auth() else '✗'}")
-        self.log(f"邮箱认证: {'✓' if self.has_email_auth() else '✗'}")
-        self.log(f"服务器数量: {len(self.server_list)}")
-        self.log(f"代理: {self.socks_proxy or '无'}")
-        
-        results = []
-        
-        with sync_playwright() as p:
-            # 启动浏览器
-            launch_args = {
-                "headless": self.headless,
-                "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
-            }
-            
-            if self.socks_proxy:
-                proxy_addr = self.socks_proxy.replace("socks5://", "").replace("socks5h://", "")
-                launch_args["proxy"] = {"server": f"socks5://{proxy_addr}"}
-                self.log(f"使用代理: {proxy_addr}")
-            
-            browser = p.chromium.launch(**launch_args)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            
-            # 添加 cookies
-            if self.has_cookie_auth():
-                cookies = self.parse_cookie_for_playwright()
-                context.add_cookies(cookies)
-                self.log("已添加 Cookie")
-            
-            page = context.new_page()
-            page.set_default_timeout(60000)
-            
-            login_success = False
-            
-            # 检查 Cookie 登录
-            if self.has_cookie_auth():
-                self.log("检查 Cookie 登录状态...")
-                page.goto(BASE_URL, wait_until="domcontentloaded")
-                time.sleep(2)
-                if self.check_login_status(page):
-                    self.log("✓ Cookie 登录成功")
-                    login_success = True
-                else:
-                    self.log("✗ Cookie 登录失败", "WARNING")
-            
-            # 尝试邮箱密码登录
-            if not login_success and self.has_email_auth():
-                self.log("尝试邮箱密码登录...")
-                try:
-                    page.goto(f"{BASE_URL}/auth/login", wait_until="domcontentloaded")
-                    time.sleep(2)
-                    page.fill('input[name="username"]', self.email)
-                    page.fill('input[name="password"]', self.password)
-                    page.click('button[type="submit"]')
-                    time.sleep(5)
-                    
-                    if self.check_login_status(page):
-                        self.log("✓ 邮箱密码登录成功")
-                        login_success = True
-                    else:
-                        self.log("✗ 邮箱密码登录失败", "ERROR")
-                except Exception as e:
-                    self.log(f"邮箱密码登录出错: {e}", "ERROR")
-            
-            if not login_success:
-                self.log("所有登录方式都失败了", "ERROR")
-                browser.close()
-                return [{"server_id": s.split('/')[-1], "success": False, "status": "login_failed", "message": "登录失败"} for s in self.server_list]
-            
-            # 处理每个服务器
-            for server_url in self.server_list:
-                result = self.process_server(page, context, server_url)
-                results.append(result)
-                self.log(f"服务器 {result['server_id']}: {result['status']} - {result['message']}")
-                time.sleep(3)
-            
-            # 获取新 cookie 并更新
-            try:
-                for c in context.cookies():
-                    if c["name"].startswith("remember_web"):
-                        new_cookie = c["name"] + "=" + c["value"]
-                        if new_cookie != self.cookie:
-                            self.update_github_secret("WEIRDHOST_COOKIE", new_cookie)
-                            self.update_github_secret("REMEMBER_WEB_COOKIE", c["value"])
-                        break
+                value = unquote(value)
             except:
                 pass
+            return (name, value)
+    
+    return (None, None)
+
+
+def build_server_url(server_id: str) -> str:
+    if not server_id:
+        return None
+    
+    server_id = server_id.strip()
+    
+    # 如果已经是完整 URL，直接返回
+    if server_id.startswith("http"):
+        return server_id
+    
+    # 否则拼接
+    return f"{BASE_URL}{server_id}"
+
+
+def calculate_remaining_time(expiry_str: str) -> str:
+    try:
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+            try:
+                expiry_dt = datetime.strptime(expiry_str.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return "无法解析"
+        diff = expiry_dt - datetime.now()
+        if diff.total_seconds() < 0:
+            return "⚠️ 已过期"
+        days = diff.days
+        hours, remainder = divmod(diff.seconds, 3600)
+        minutes = remainder // 60
+        parts = []
+        if days > 0:
+            parts.append(f"{days}天")
+        if hours > 0:
+            parts.append(f"{hours}小时")
+        if minutes > 0 and days == 0:
+            parts.append(f"{minutes}分钟")
+        return " ".join(parts) if parts else "不到1分钟"
+    except:
+        return "计算失败"
+
+
+def parse_renew_error(body: dict) -> str:
+    try:
+        if isinstance(body, dict) and "errors" in body:
+            errors = body.get("errors", [])
+            if errors and isinstance(errors[0], dict):
+                return errors[0].get("detail", str(body))
+        return str(body)
+    except:
+        return str(body)
+
+
+def is_cooldown_error(error_detail: str) -> bool:
+    keywords = ["can only once at one time period", "can't renew", "cannot renew", "already renewed"]
+    return any(kw in error_detail.lower() for kw in keywords)
+
+
+async def wait_for_cloudflare(page, max_wait: int = 120) -> bool:
+    print("🛡️ 等待 Cloudflare 验证...")
+    for i in range(max_wait):
+        try:
+            is_cf = await page.evaluate("""
+                () => {
+                    if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+                    if (document.querySelector('[data-sitekey]')) return true;
+                    const text = document.body.innerText;
+                    return text.includes('Checking') || text.includes('moment') || text.includes('human');
+                }
+            """)
+            if not is_cf:
+                print(f"✅ CF 验证通过 ({i+1}秒)")
+                return True
+            if i % 10 == 0:
+                print(f"⏳ CF 验证中... ({i+1}/{max_wait}秒)")
+            await page.wait_for_timeout(1000)
+        except:
+            await page.wait_for_timeout(1000)
+    print("⚠️ CF 验证超时")
+    return False
+
+
+async def wait_for_page_ready(page, max_wait: int = 15) -> bool:
+    for i in range(max_wait):
+        try:
+            ready = await page.evaluate("""
+                () => {
+                    const hasButton = document.querySelector('button') !== null;
+                    const hasContent = document.body.innerText.length > 100;
+                    return hasButton && hasContent;
+                }
+            """)
+            if ready:
+                print(f"✅ 页面就绪 ({i+1}秒)")
+                return True
+        except:
+            pass
+        await page.wait_for_timeout(1000)
+    return False
+
+
+def encrypt_secret(public_key: str, secret_value: str) -> str:
+    pk = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(pk)
+    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("utf-8")
+
+
+async def update_github_secret(secret_name: str, secret_value: str) -> bool:
+    repo_token = os.environ.get("REPO_TOKEN", "").strip()
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo_token or not repository or not NACL_AVAILABLE:
+        return False
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {repo_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with aiohttp.ClientSession() as session:
+        try:
+            pk_url = f"https://api.github.com/repos/{repository}/actions/secrets/public-key"
+            async with session.get(pk_url, headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+                pk_data = await resp.json()
+            encrypted_value = encrypt_secret(pk_data["key"], secret_value)
+            secret_url = f"https://api.github.com/repos/{repository}/actions/secrets/{secret_name}"
+            payload = {"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]}
+            async with session.put(secret_url, headers=headers, json=payload) as resp:
+                return resp.status in (201, 204)
+        except:
+            return False
+
+
+async def tg_notify(message: str):
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"})
+        except:
+            pass
+
+
+async def tg_notify_photo(photo_path: str, caption: str = ""):
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    async with aiohttp.ClientSession() as session:
+        try:
+            with open(photo_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", chat_id)
+                data.add_field("photo", f, filename=os.path.basename(photo_path))
+                data.add_field("caption", caption)
+                data.add_field("parse_mode", "HTML")
+                await session.post(url, data=data)
+        except:
+            pass
+
+
+async def extract_remember_cookie(context) -> tuple:
+    try:
+        cookies = await context.cookies()
+        for cookie in cookies:
+            if cookie["name"].startswith("remember_web"):
+                return (cookie["name"], cookie["value"])
+    except:
+        pass
+    return (None, None)
+
+
+async def get_expiry_time(page) -> str:
+    try:
+        return await page.evaluate("""
+            () => {
+                const text = document.body.innerText;
+                const match = text.match(/유통기한\\s*(\\d{4}-\\d{2}-\\d{2}(?:\\s+\\d{2}:\\d{2}:\\d{2})?)/);
+                if (match) return match[1].trim();
+                return 'Unknown';
+            }
+        """)
+    except:
+        return "Unknown"
+
+
+async def find_renew_button(page):
+    selectors = [
+        'button:has-text("시간추가")',
+        'button:has-text("Add Time")',
+        'button:has-text("Renew")',
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if await locator.count() > 0:
+                return locator.nth(0)
+        except:
+            continue
+    return None
+
+
+async def add_server_time():
+    # 解析新格式的环境变量
+    weirdhost_cookie = os.environ.get("WEIRDHOST_COOKIE", "").strip()
+    weirdhost_id = os.environ.get("WEIRDHOST_ID", "").strip()
+    
+    # 解析 Cookie
+    cookie_name, cookie_value = parse_weirdhost_cookie(weirdhost_cookie)
+    
+    # 构建服务器 URL
+    server_url = build_server_url(weirdhost_id)
+
+    if not cookie_name or not cookie_value:
+        await tg_notify("🎁 <b>Weirdhost 续订报告</b>\n\n❌ WEIRDHOST_COOKIE 未设置或格式错误\n\n格式: remember_web_xxxxx=eyJpdiI6...")
+        return
+    
+    if not server_url:
+        await tg_notify("🎁 <b>Weirdhost 续订报告</b>\n\n❌ WEIRDHOST_ID 未设置\n\n格式: 8a8db3cc")
+        return
+
+    print(f"🔑 Cookie Name: {cookie_name}")
+    print(f"🔑 Cookie Value: {cookie_value[:50]}...")
+    print(f"🌐 Server URL: {server_url}")
+    print("🚀 启动 Playwright...")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            extra_http_headers={'Accept-Language': 'zh-CN,zh;q=0.9'}
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
+        
+        page = await context.new_page()
+        page.set_default_timeout(120000)
+
+        renew_result = {"captured": False, "status": None, "body": None}
+
+        async def capture_response(response):
+            if "/renew" in response.url and "notfreeservers" in response.url:
+                renew_result["captured"] = True
+                renew_result["status"] = response.status
+                try:
+                    renew_result["body"] = await response.json()
+                except:
+                    renew_result["body"] = await response.text()
+                print(f"📡 API 响应: {response.status}")
+
+        page.on("response", capture_response)
+
+        try:
+            await context.add_cookies([{
+                "name": cookie_name, 
+                "value": cookie_value, 
+                "domain": "hub.weirdhost.xyz", 
+                "path": "/"
+            }])
+
+            print(f"🌐 访问: {server_url}")
+            await page.goto(server_url, timeout=90000)
+            await wait_for_cloudflare(page, max_wait=120)
+            await page.wait_for_timeout(2000)
+            await wait_for_page_ready(page, max_wait=20)
+
+            if "/auth/login" in page.url or "/login" in page.url:
+                msg = "🎁 <b>Weirdhost 续订报告</b>\n\n❌ Cookie 已失效，请手动更新"
+                await page.screenshot(path="login_failed.png", full_page=True)
+                await tg_notify_photo("login_failed.png", msg)
+                return
+
+            print("✅ 登录成功")
+
+            expiry_time = await get_expiry_time(page)
+            remaining_time = calculate_remaining_time(expiry_time)
+            print(f"📅 到期: {expiry_time} | 剩余: {remaining_time}")
+
+            print("\n" + "="*50)
+            print("📌 点击续期按钮")
+            print("="*50)
             
-            browser.close()
-        
-        return results
-    
-    def write_readme(self, results: List[Dict]):
-        """写入 README 文件"""
-        beijing_time = datetime.now(timezone(timedelta(hours=8)))
-        timestamp = beijing_time.strftime('%Y-%m-%d %H:%M:%S')
-        
-        status_icons = {
-            "success": "✅",
-            "cooldown": "⏳",
-            "changed": "⚠️",
-            "no_button": "❌",
-            "button_disabled": "❌",
-            "login_failed": "❌",
-            "turnstile_failed": "❌",
-            "error": "💥",
-            "no_change": "⚠️",
-            "unknown": "❓"
-        }
-        
-        content = f"""# WeirdHost 自动续期
+            add_button = await find_renew_button(page)
+            if not add_button:
+                msg = f"🎁 <b>Weirdhost 续订报告</b>\n\n⚠️ 未找到续期按钮\n📅 到期: {expiry_time}\n⏳ 剩余: {remaining_time}"
+                await page.screenshot(path="no_button.png", full_page=True)
+                await tg_notify_photo("no_button.png", msg)
+                return
 
-**最后运行**: `{timestamp}` (北京时间)
+            await add_button.wait_for(state="visible", timeout=10000)
+            await page.wait_for_timeout(1000)
+            await add_button.click()
+            print("🔄 已点击续期按钮，等待 CF 验证...")
 
-## 运行结果
+            await page.wait_for_timeout(5000)
+            cf_passed = await wait_for_cloudflare(page, max_wait=120)
+            
+            if not cf_passed:
+                msg = f"🎁 <b>Weirdhost 续订报告</b>\n\n⚠️ CF 验证超时\n📅 到期: {expiry_time}\n⏳ 剩余: {remaining_time}"
+                await page.screenshot(path="cf_timeout.png", full_page=True)
+                await tg_notify_photo("cf_timeout.png", msg)
+                return
 
-"""
-        for r in results:
-            icon = status_icons.get(r["status"], "❓")
-            content += f"- 服务器 `{r['server_id']}`: {icon} {r['message']}\n"
-        
-        with open('README.md', 'w', encoding='utf-8') as f:
-            f.write(content)
-        
-        self.log("✓ README 已更新")
+            print("⏳ 等待复选框...")
+            try:
+                checkbox = await page.wait_for_selector('input[type="checkbox"]', timeout=5000)
+                await checkbox.click()
+                print("✅ 已点击复选框")
+            except:
+                try:
+                    await page.evaluate("document.querySelector('input[type=\"checkbox\"]')?.click()")
+                    print("✅ 已通过 JS 点击复选框")
+                except:
+                    print("⚠️ 未找到复选框")
 
+            print("⏳ 等待 API 响应...")
+            await page.wait_for_timeout(2000)
+            
+            for i in range(30):
+                if renew_result["captured"]:
+                    print(f"✅ 捕获到响应 ({i+1}秒)")
+                    break
+                if i % 5 == 4:
+                    print(f"⏳ 等待 API... ({i+1}秒)")
+                await page.wait_for_timeout(1000)
 
-def main():
-    renew = WeirdhostRenew()
-    results = renew.run()
-    renew.write_readme(results)
-    
-    # 发送通知
-    success_count = sum(1 for r in results if r["success"])
-    total_count = len(results)
-    
-    if success_count == total_count:
-        msg = f"✅ <b>WeirdHost 续期完成</b>\n\n全部 {total_count} 个服务器处理成功"
-    else:
-        msg = f"⚠️ <b>WeirdHost 续期部分完成</b>\n\n成功: {success_count}/{total_count}"
-        for r in results:
-            if not r["success"]:
-                msg += f"\n❌ {r['server_id']}: {r['message']}"
-    
-    # 查找截图
-    screenshot = None
-    for f in os.listdir('.'):
-        if f.endswith('.png'):
-            screenshot = f
-            break
-    
-    renew.send_telegram(msg, screenshot)
-    
-    # 退出码
-    if success_count == 0:
-        sys.exit(1)
-    sys.exit(0)
+            if renew_result["captured"]:
+                status = renew_result["status"]
+                body = renew_result["body"]
+
+                if status in (200, 201, 204):
+                    await page.wait_for_timeout(2000)
+                    await page.reload()
+                    await wait_for_cloudflare(page, max_wait=30)
+                    await page.wait_for_timeout(3000)
+                    new_expiry = await get_expiry_time(page)
+                    new_remaining = calculate_remaining_time(new_expiry)
+                    
+                    msg = f"""🎁 <b>Weirdhost 续订报告</b>
+
+✅ 续期成功！
+📅 新到期时间: {new_expiry}
+⏳ 剩余时间: {new_remaining}
+🔗 {server_url}"""
+                    print(f"✅ 续期成功！")
+                    await tg_notify(msg)
+
+                elif status == 400:
+                    error_detail = parse_renew_error(body)
+                    if is_cooldown_error(error_detail):
+                        msg = f"""🎁 <b>Weirdhost 续订报告</b>
+
+ℹ️ 暂无需续期（冷却期内）
+📅 到期时间: {expiry_time}
+⏳ 剩余时间: {remaining_time}"""
+                        print(f"ℹ️ 冷却期内")
+                        await tg_notify(msg)
+                    else:
+                        msg = f"""🎁 <b>Weirdhost 续订报告</b>
+
+❌ 续期失败
+📝 错误: {error_detail}
+📅 到期时间: {expiry_time}
+⏳ 剩余时间: {remaining_time}"""
+                        await tg_notify(msg)
+                else:
+                    msg = f"""🎁 <b>Weirdhost 续订报告</b>
+
+❌ 续期失败
+📝 HTTP {status}: {body}
+📅 到期时间: {expiry_time}
+⏳ 剩余时间: {remaining_time}"""
+                    await tg_notify(msg)
+            else:
+                msg = f"""🎁 <b>Weirdhost 续订报告</b>
+
+⚠️ 未检测到 API 响应
+📅 到期时间: {expiry_time}
+⏳ 剩余时间: {remaining_time}"""
+                await page.screenshot(path="no_response.png", full_page=True)
+                await tg_notify_photo("no_response.png", msg)
+
+            # 更新 Cookie（使用新的 Secret 名称和格式）
+            new_name, new_value = await extract_remember_cookie(context)
+            if new_name and new_value and new_value != cookie_value:
+                new_cookie_str = f"{new_name}={new_value}"
+                updated = await update_github_secret("WEIRDHOST_COOKIE", new_cookie_str)
+                if updated:
+                    print("✅ 已自动更新 WEIRDHOST_COOKIE")
+
+        except Exception as e:
+            msg = f"🎁 <b>Weirdhost 续订报告</b>\n\n❌ 异常: {repr(e)}"
+            print(msg)
+            try:
+                await page.screenshot(path="error.png", full_page=True)
+                await tg_notify_photo("error.png", msg)
+            except:
+                pass
+            await tg_notify(msg)
+
+        finally:
+            await context.close()
+            await browser.close()
 
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(add_server_time())
