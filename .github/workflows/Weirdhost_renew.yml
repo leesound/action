@@ -28,8 +28,9 @@ jobs:
       
       - name: 安装 Python 依赖
         run: |
-          pip install "seleniumbase>=4.28.0" pynacl
-          seleniumbase install chromedriver
+          pip install playwright pynacl
+          playwright install chromium
+          playwright install-deps chromium
       
       - name: 下载 Hysteria2
         run: |
