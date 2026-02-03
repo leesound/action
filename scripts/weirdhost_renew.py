@@ -214,15 +214,12 @@ def is_logged_in(sb) -> bool:
         if "/login" in current_url or "/auth" in current_url:
             return False
         
-        # 检查是否有到期时间显示
         if get_expiry_from_page(sb) != "Unknown":
             return True
         
-        # 检查是否有续期按钮
         if sb.is_element_present("//button//span[contains(text(), '시간추가')]"):
             return True
         
-        # 检查是否有用户信息
         page_source = sb.get_page_source()
         if "PterodactylUser" in page_source:
             return True
@@ -232,26 +229,85 @@ def is_logged_in(sb) -> bool:
         return False
 
 
-def check_cooldown_message(sb) -> bool:
-    """检查是否有冷却期提示"""
+def check_cooldown_popup(sb) -> bool:
+    """检查是否有冷却期弹窗 - 아직 연장을 할수없어요"""
     try:
-        page_text = sb.get_page_source()
-        cooldown_patterns = [
-            r"can only renew",
-            r"already renewed",
-            r"wait.*hour",
-            r"wait.*minute",
-            r"한 번만",
-            r"이미.*갱신",
-            r"남은.*시간",
-            r"too soon",
+        # 检查弹窗文字
+        cooldown_texts = [
+            "아직 연장을 할수없어요",  # 还不能延长
+            "조금만 더 기다려주세요",  # 请再稍等
+            "can only renew",
+            "wait",
         ]
-        for pattern in cooldown_patterns:
-            if re.search(pattern, page_text, re.I):
+        
+        page_text = sb.get_page_source()
+        for text in cooldown_texts:
+            if text in page_text:
+                print(f"[*] 检测到冷却期提示: {text}")
                 return True
+        
+        # 检查 error 类型的弹窗
+        if sb.is_element_present("//div[@type='error']"):
+            return True
+            
     except:
         pass
     return False
+
+
+def click_popup_button(sb) -> bool:
+    """点击弹窗按钮 (Next/확인/OK)"""
+    button_texts = ["Next", "확인", "OK", "Close", "닫기"]
+    
+    for text in button_texts:
+        try:
+            # 查找弹窗内的按钮
+            xpath = f"//div[contains(@class, 'Popup')]//button//span[contains(text(), '{text}')]/parent::button"
+            if sb.is_element_visible(xpath):
+                print(f"[*] 点击弹窗按钮: {text}")
+                sb.click(xpath)
+                return True
+            
+            # 备用选择器
+            xpath = f"//button//span[contains(text(), '{text}')]"
+            if sb.is_element_visible(xpath):
+                print(f"[*] 点击按钮: {text}")
+                sb.click(xpath)
+                return True
+        except:
+            pass
+    
+    return False
+
+
+def wait_for_result(sb, timeout: int = 45) -> dict:
+    """等待验证结果，检测成功或冷却期弹窗"""
+    print(f"[*] 等待验证结果 (最多 {timeout} 秒)...")
+    
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        # 检查冷却期弹窗
+        if check_cooldown_popup(sb):
+            return {"status": "cooldown", "message": "冷却期内"}
+        
+        # 检查成功提示
+        try:
+            page_text = sb.get_page_source()
+            success_patterns = [
+                "연장.*성공",  # 延长成功
+                "success",
+                "완료",  # 完成
+            ]
+            for pattern in success_patterns:
+                if re.search(pattern, page_text, re.I):
+                    return {"status": "success", "message": "续期成功"}
+        except:
+            pass
+        
+        time.sleep(2)
+    
+    return {"status": "timeout", "message": "等待超时"}
 
 
 def add_server_time():
@@ -302,7 +358,6 @@ def add_server_time():
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
             
-            # 检查登录状态
             if not is_logged_in(sb):
                 print("[!] 未登录，尝试重新设置 Cookie...")
                 sb.add_cookie({
@@ -333,11 +388,8 @@ def add_server_time():
             print(f"\n[步骤3] 点击续期按钮 (시간추가)")
             random_delay(1.0, 2.0)
             
-            # 查找并点击 시간추가 按钮
             renew_button_xpath = "//button//span[contains(text(), '시간추가')]/parent::button"
-            
             if not sb.is_element_present(renew_button_xpath):
-                # 尝试其他选择器
                 renew_button_xpath = "//button[contains(., '시간추가')]"
             
             if not sb.is_element_present(renew_button_xpath):
@@ -349,32 +401,16 @@ def add_server_time():
             print("[+] 已点击续期按钮")
             time.sleep(3)
             
-            # 检查冷却期
-            if check_cooldown_message(sb):
-                msg = f"""🎁 <b>Weirdhost 续订报告</b>
-
-ℹ️ 暂无需续期（冷却期内）
-📅 到期: {original_expiry}
-⏳ 剩余: {remaining}"""
-                print("\n[*] 冷却期内")
-                sync_tg_notify(msg)
-                return
-            
             sb.save_screenshot("after_click.png")
             
             # ========== 步骤5：处理 Turnstile 验证 ==========
             print(f"\n[步骤4] 处理 Turnstile 验证")
             
-            # 等待 Turnstile iframe 出现
-            time.sleep(2)
-            
-            # 使用 uc_gui_click_captcha 处理验证码
             for attempt in range(3):
                 print(f"[*] 尝试处理验证码 ({attempt + 1}/3)")
                 try:
                     sb.uc_gui_click_captcha()
                     print("[+] 验证码处理完成")
-                    time.sleep(3)
                     break
                 except Exception as e:
                     print(f"[!] 尝试 {attempt + 1} 失败: {e}")
@@ -382,20 +418,33 @@ def add_server_time():
             
             sb.save_screenshot("after_captcha.png")
             
-            # 再次检查冷却期
-            if check_cooldown_message(sb):
+            # ========== 步骤6：等待结果 ==========
+            print(f"\n[步骤5] 等待验证结果")
+            
+            result = wait_for_result(sb, timeout=45)
+            print(f"[*] 结果: {result}")
+            
+            sb.save_screenshot("result.png")
+            
+            # 处理冷却期
+            if result["status"] == "cooldown":
+                # 点击 Next 按钮关闭弹窗
+                click_popup_button(sb)
+                time.sleep(1)
+                
                 msg = f"""🎁 <b>Weirdhost 续订报告</b>
 
 ℹ️ 暂无需续期（冷却期内）
 📅 到期: {original_expiry}
-⏳ 剩余: {remaining}"""
-                print("\n[*] 冷却期内")
+⏳ 剩余: {remaining}
+📝 아직 연장을 할수없어요"""
+                print("\n[*] 冷却期内，无需续期")
                 sync_tg_notify(msg)
                 return
             
-            # ========== 步骤6：验证续期结果 ==========
-            print(f"\n[步骤5] 验证续期结果")
-            time.sleep(5)
+            # ========== 步骤7：验证续期结果 ==========
+            print(f"\n[步骤6] 验证续期结果")
+            time.sleep(3)
             
             # 重新访问页面获取最新状态
             print("[*] 重新访问服务器页面...")
@@ -438,9 +487,9 @@ def add_server_time():
 ℹ️ 到期时间未变化
 📅 到期: {original_expiry}
 ⏳ 剩余: {remaining}
-📝 可能在冷却期内或验证未通过"""
+📝 可能在冷却期内"""
                     print("\n[*] 时间未变化")
-                    sync_tg_notify_photo("final_state.png", msg)
+                    sync_tg_notify(msg)
                 
                 else:
                     msg = f"""🎁 <b>Weirdhost 续订报告</b>
@@ -486,7 +535,7 @@ def add_server_time():
         print(f"\n[!] 异常: {repr(e)}")
         traceback.print_exc()
         
-        for img in ["final_state.png", "after_captcha.png", "after_click.png", "before_renew.png"]:
+        for img in ["final_state.png", "result.png", "after_captcha.png", "after_click.png", "before_renew.png"]:
             if os.path.exists(img):
                 sync_tg_notify_photo(img, error_msg)
                 break
