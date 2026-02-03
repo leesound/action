@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weirdhost 自动续期脚本 v4
-使用 uc_gui_click_captcha 处理 Turnstile
+Weirdhost 自动续期脚本 v5
 """
 
 import os
@@ -15,7 +14,7 @@ import re
 import platform
 from datetime import datetime
 from urllib.parse import unquote
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 from seleniumbase import SB
 
@@ -179,21 +178,26 @@ async def update_github_secret(secret_name: str, secret_value: str) -> bool:
 # 核心逻辑
 # ============================================================
 def get_expiry_from_page(sb) -> str:
-    """从页面提取到期时间"""
+    """从页面提取到期时间 - 유통기한 2026-02-13 00:06:57"""
     try:
+        # 方法1: 直接查找包含 유통기한 的元素
+        try:
+            elements = sb.find_elements("xpath", "//*[contains(text(), '유통기한')]")
+            for el in elements:
+                text = el.text
+                match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', text)
+                if match:
+                    return match.group(1).strip()
+        except:
+            pass
+        
+        # 方法2: 从页面源码提取
         page_text = sb.get_page_source()
-        
-        # 韩文: 유통기한 2026-02-13 00:06:57
-        match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)', page_text)
+        match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', page_text)
         if match:
             return match.group(1).strip()
         
-        # 英文 Expiry/Expires
-        match = re.search(r'Expir(?:y|es?)\s*[:\s]*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)', page_text, re.I)
-        if match:
-            return match.group(1).strip()
-        
-        # 通用日期格式
+        # 方法3: 通用日期格式
         match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', page_text)
         if match:
             return match.group(1).strip()
@@ -203,116 +207,47 @@ def get_expiry_from_page(sb) -> str:
         return "Unknown"
 
 
-def is_on_server_page(sb) -> bool:
-    """检查是否在服务器管理页面"""
+def is_logged_in(sb) -> bool:
+    """检查是否已登录"""
     try:
         current_url = sb.get_current_url()
-        if "/server/" not in current_url:
+        if "/login" in current_url or "/auth" in current_url:
             return False
         
-        expiry = get_expiry_from_page(sb)
-        if expiry != "Unknown":
+        # 检查是否有到期时间显示
+        if get_expiry_from_page(sb) != "Unknown":
             return True
         
-        button_texts = ["시간추가", "Add Time", "Renew"]
-        for text in button_texts:
-            try:
-                if sb.is_element_present(f"//button[contains(text(), '{text}')]"):
-                    return True
-            except:
-                pass
+        # 检查是否有续期按钮
+        if sb.is_element_present("//button//span[contains(text(), '시간추가')]"):
+            return True
+        
+        # 检查是否有用户信息
+        page_source = sb.get_page_source()
+        if "PterodactylUser" in page_source:
+            return True
         
         return False
     except:
         return False
 
 
-def try_click_captcha(sb, max_attempts: int = 3) -> bool:
-    """尝试点击验证码"""
-    for attempt in range(max_attempts):
-        print(f"[*] 处理验证码 ({attempt + 1}/{max_attempts})")
-        try:
-            sb.uc_gui_click_captcha()
-            time.sleep(3)
-            print("[+] 验证码处理完成")
-            return True
-        except Exception as e:
-            print(f"[!] 尝试 {attempt + 1} 失败: {e}")
-            time.sleep(2)
-    return False
-
-
-def check_cooldown(sb) -> bool:
-    """检查是否在冷却期"""
+def check_cooldown_message(sb) -> bool:
+    """检查是否有冷却期提示"""
     try:
-        page_text = sb.get_page_source().lower()
+        page_text = sb.get_page_source()
         cooldown_patterns = [
-            "can only", "already", "cannot renew", "too soon",
-            "wait", "한 번만", "이미", "불가", "남음"
+            r"can only renew",
+            r"already renewed",
+            r"wait.*hour",
+            r"wait.*minute",
+            r"한 번만",
+            r"이미.*갱신",
+            r"남은.*시간",
+            r"too soon",
         ]
         for pattern in cooldown_patterns:
-            if re.search(pattern, page_text):
-                return True
-    except:
-        pass
-    return False
-
-
-def find_and_click_renew_button(sb) -> bool:
-    """查找并点击续期按钮"""
-    button_texts = ["시간추가", "Add Time", "Renew", "续期", "연장"]
-    
-    for text in button_texts:
-        try:
-            xpath = f"//button[contains(text(), '{text}')]"
-            if sb.is_element_present(xpath):
-                print(f"[*] 找到按钮: {text}")
-                random_delay(0.5, 1.0)
-                sb.click(xpath)
-                return True
-        except:
-            pass
-        
-        try:
-            xpath = f"//a[contains(text(), '{text}')]"
-            if sb.is_element_present(xpath):
-                print(f"[*] 找到链接: {text}")
-                random_delay(0.5, 1.0)
-                sb.click(xpath)
-                return True
-        except:
-            pass
-    
-    return False
-
-
-def click_confirm_if_exists(sb):
-    """点击确认按钮"""
-    confirm_texts = ["확인", "Confirm", "OK", "Submit", "Yes", "동의"]
-    for text in confirm_texts:
-        try:
-            xpath = f"//button[contains(text(), '{text}')]"
-            if sb.is_element_visible(xpath):
-                print(f"[*] 点击确认: {text}")
-                random_delay(0.3, 0.8)
-                sb.click(xpath)
-                return True
-        except:
-            pass
-    return False
-
-
-def click_checkbox_if_exists(sb):
-    """点击复选框"""
-    try:
-        selectors = [
-            'input[type="checkbox"]:not(:checked)',
-            '.modal input[type="checkbox"]',
-        ]
-        for selector in selectors:
-            if sb.is_element_visible(selector):
-                print(f"[*] 点击复选框")
-                sb.click(selector)
+            if re.search(pattern, page_text, re.I):
                 return True
     except:
         pass
@@ -336,7 +271,7 @@ def add_server_time():
         return
     
     print("=" * 60)
-    print("Weirdhost 自动续期 v4")
+    print("Weirdhost 自动续期 v5")
     print("=" * 60)
     print(f"[*] Cookie: {cookie_name}")
     print(f"[*] URL: {server_url}")
@@ -346,7 +281,7 @@ def add_server_time():
     original_expiry = "Unknown"
     
     try:
-        with SB(uc=True, test=True, locale="en", headless=False) as sb:
+        with SB(uc=True, test=True, locale="ko", headless=False) as sb:
             print("\n[*] 浏览器已启动")
             
             # ========== 步骤1：访问首页设置 Cookie ==========
@@ -368,14 +303,8 @@ def add_server_time():
             time.sleep(3)
             
             # 检查登录状态
-            current_url = sb.get_current_url()
-            if "/login" in current_url:
-                sb.save_screenshot("login_required.png")
-                sync_tg_notify_photo("login_required.png", "🎁 <b>Weirdhost</b>\n\n❌ Cookie 已失效")
-                return
-            
-            if not is_on_server_page(sb):
-                print("[!] 页面异常，尝试重新访问...")
+            if not is_logged_in(sb):
+                print("[!] 未登录，尝试重新设置 Cookie...")
                 sb.add_cookie({
                     "name": cookie_name,
                     "value": cookie_value,
@@ -385,9 +314,9 @@ def add_server_time():
                 sb.uc_open_with_reconnect(server_url, reconnect_time=5)
                 time.sleep(3)
             
-            if not is_on_server_page(sb):
-                sb.save_screenshot("wrong_page.png")
-                sync_tg_notify_photo("wrong_page.png", "🎁 <b>Weirdhost</b>\n\n❌ 无法访问服务器页面")
+            if not is_logged_in(sb):
+                sb.save_screenshot("login_failed.png")
+                sync_tg_notify_photo("login_failed.png", "🎁 <b>Weirdhost</b>\n\n❌ Cookie 已失效，需要重新登录")
                 return
             
             print("[+] 登录成功")
@@ -401,19 +330,27 @@ def add_server_time():
             sb.save_screenshot("before_renew.png")
             
             # ========== 步骤4：点击续期按钮 ==========
-            print(f"\n[步骤3] 点击续期按钮")
+            print(f"\n[步骤3] 点击续期按钮 (시간추가)")
             random_delay(1.0, 2.0)
             
-            if not find_and_click_renew_button(sb):
+            # 查找并点击 시간추가 按钮
+            renew_button_xpath = "//button//span[contains(text(), '시간추가')]/parent::button"
+            
+            if not sb.is_element_present(renew_button_xpath):
+                # 尝试其他选择器
+                renew_button_xpath = "//button[contains(., '시간추가')]"
+            
+            if not sb.is_element_present(renew_button_xpath):
                 sb.save_screenshot("no_button.png")
                 sync_tg_notify_photo("no_button.png", f"🎁 <b>Weirdhost</b>\n\n⚠️ 未找到续期按钮\n📅 到期: {original_expiry}\n⏳ 剩余: {remaining}")
                 return
             
+            sb.click(renew_button_xpath)
             print("[+] 已点击续期按钮")
             time.sleep(3)
             
             # 检查冷却期
-            if check_cooldown(sb):
+            if check_cooldown_message(sb):
                 msg = f"""🎁 <b>Weirdhost 续订报告</b>
 
 ℹ️ 暂无需续期（冷却期内）
@@ -425,19 +362,28 @@ def add_server_time():
             
             sb.save_screenshot("after_click.png")
             
-            # ========== 步骤5：处理验证 ==========
+            # ========== 步骤5：处理 Turnstile 验证 ==========
             print(f"\n[步骤4] 处理 Turnstile 验证")
-            try_click_captcha(sb, max_attempts=3)
+            
+            # 等待 Turnstile iframe 出现
             time.sleep(2)
             
-            click_checkbox_if_exists(sb)
-            time.sleep(1)
+            # 使用 uc_gui_click_captcha 处理验证码
+            for attempt in range(3):
+                print(f"[*] 尝试处理验证码 ({attempt + 1}/3)")
+                try:
+                    sb.uc_gui_click_captcha()
+                    print("[+] 验证码处理完成")
+                    time.sleep(3)
+                    break
+                except Exception as e:
+                    print(f"[!] 尝试 {attempt + 1} 失败: {e}")
+                    time.sleep(2)
             
-            click_confirm_if_exists(sb)
-            time.sleep(3)
+            sb.save_screenshot("after_captcha.png")
             
             # 再次检查冷却期
-            if check_cooldown(sb):
+            if check_cooldown_message(sb):
                 msg = f"""🎁 <b>Weirdhost 续订报告</b>
 
 ℹ️ 暂无需续期（冷却期内）
@@ -447,13 +393,11 @@ def add_server_time():
                 sync_tg_notify(msg)
                 return
             
-            sb.save_screenshot("after_confirm.png")
-            
-            # ========== 步骤6：验证结果 ==========
+            # ========== 步骤6：验证续期结果 ==========
             print(f"\n[步骤5] 验证续期结果")
             time.sleep(5)
             
-            # 重新访问页面
+            # 重新访问页面获取最新状态
             print("[*] 重新访问服务器页面...")
             sb.add_cookie({
                 "name": cookie_name,
@@ -494,9 +438,9 @@ def add_server_time():
 ℹ️ 到期时间未变化
 📅 到期: {original_expiry}
 ⏳ 剩余: {remaining}
-📝 可能在冷却期内"""
+📝 可能在冷却期内或验证未通过"""
                     print("\n[*] 时间未变化")
-                    sync_tg_notify(msg)
+                    sync_tg_notify_photo("final_state.png", msg)
                 
                 else:
                     msg = f"""🎁 <b>Weirdhost 续订报告</b>
@@ -509,7 +453,7 @@ def add_server_time():
             elif new_expiry != "Unknown":
                 msg = f"""🎁 <b>Weirdhost 续订报告</b>
 
-⚠️ 无法比较时间
+✅ 续期完成
 📅 到期: {new_expiry}
 ⏳ 剩余: {new_remaining}"""
                 sync_tg_notify(msg)
@@ -542,7 +486,7 @@ def add_server_time():
         print(f"\n[!] 异常: {repr(e)}")
         traceback.print_exc()
         
-        for img in ["final_state.png", "after_confirm.png", "after_click.png", "before_renew.png"]:
+        for img in ["final_state.png", "after_captcha.png", "after_click.png", "before_renew.png"]:
             if os.path.exists(img):
                 sync_tg_notify_photo(img, error_msg)
                 break
