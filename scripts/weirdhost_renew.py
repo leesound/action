@@ -565,4 +565,3 @@ def add_server_time():
 
 
 if __name__ == "__main__":
-    ad
