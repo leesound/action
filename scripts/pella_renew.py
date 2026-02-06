@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pella 自动续期脚本 增加重启功能
+Pella 自动续期脚本 增加重启功能（智能检测版）
 
 配置变量说明:
 - 单账号变量:
@@ -68,6 +68,7 @@ class PellaAutoRenew:
         self.initial_expiry_value = -1.0
         self.server_url = None
         self.restart_output = ""
+        self.server_status = "unknown"
         
         if not self.email or not self.password:
             raise ValueError("邮箱和密码不能为空")
@@ -286,6 +287,79 @@ class PellaAutoRenew:
         except Exception as e:
             raise Exception(f"❌ 获取服务器失败: {e}")
     
+    def check_server_status(self):
+        """检查服务器当前状态"""
+        if not self.server_url:
+            return "unknown"
+        
+        if '/server/' not in self.driver.current_url:
+            self.driver.get(self.server_url)
+            time.sleep(3)
+        
+        page_text = self.driver.find_element(By.TAG_NAME, "body").text.upper()
+        
+        # 检查运行状态指示
+        running_indicators = ["STATUS: RUNNING", "RUNNING", "ONLINE", "ACTIVE"]
+        stopped_indicators = ["STATUS: STOPPED", "STOPPED", "OFFLINE", "INACTIVE", "NOT RUNNING"]
+        
+        # 检查页面状态元素
+        try:
+            status_elements = self.driver.find_elements(By.XPATH, 
+                "//*[contains(text(), 'Status') or contains(text(), 'status')]")
+            
+            for elem in status_elements:
+                try:
+                    parent = elem.find_element(By.XPATH, "./..")
+                    parent_text = parent.text.upper()
+                    
+                    for indicator in running_indicators:
+                        if indicator in parent_text:
+                            logger.info("✅ 服务器状态: 运行中")
+                            self.server_status = "running"
+                            return "running"
+                    
+                    for indicator in stopped_indicators:
+                        if indicator in parent_text:
+                            logger.info("⚠️ 服务器状态: 已停止")
+                            self.server_status = "stopped"
+                            return "stopped"
+                except:
+                    continue
+        except:
+            pass
+        
+        # 检查是否有 START 按钮（有则说明服务器已停止）
+        try:
+            start_buttons = self.driver.find_elements(By.XPATH, 
+                "//button[contains(text(), 'START') and not(contains(text(), 'RESTART'))]")
+            
+            for btn in start_buttons:
+                if btn.is_displayed() and btn.is_enabled():
+                    btn_text = btn.text.upper().strip()
+                    if btn_text == "START" or btn_text == "START SERVER":
+                        logger.info("⚠️ 服务器状态: 已停止 (发现START按钮)")
+                        self.server_status = "stopped"
+                        return "stopped"
+        except:
+            pass
+        
+        # 通过页面文本检查
+        for indicator in running_indicators:
+            if indicator in page_text:
+                logger.info("✅ 服务器状态: 运行中")
+                self.server_status = "running"
+                return "running"
+        
+        for indicator in stopped_indicators:
+            if indicator in page_text:
+                logger.info("⚠️ 服务器状态: 已停止")
+                self.server_status = "stopped"
+                return "stopped"
+        
+        logger.info("❓ 服务器状态: 无法确定")
+        self.server_status = "unknown"
+        return "unknown"
+    
     def renew_server(self):
         if not self.server_url:
             raise Exception("❌ 缺少服务器URL")
@@ -341,12 +415,23 @@ class PellaAutoRenew:
             raise Exception(f"❌ 续期错误: {e}")
 
     def restart_server(self):
-        """点击重启按钮并等待输出"""
+        """点击重启按钮（仅在服务器停止时执行）"""
         if not self.server_url:
             logger.warning("⚠️ 缺少服务器URL，跳过重启")
-            return False, ""
+            return False, "跳过: 缺少服务器URL"
         
-        logger.info("🔄 开始重启服务器...")
+        # 先检查服务器状态
+        status = self.check_server_status()
+        
+        if status == "running":
+            logger.info("✅ 服务器正在运行，无需重启")
+            return True, "跳过: 服务器正在运行"
+        
+        if status == "unknown":
+            logger.info("❓ 无法确定服务器状态，跳过重启")
+            return False, "跳过: 无法确定服务器状态"
+        
+        logger.info("🔄 服务器已停止，开始重启...")
         
         if '/server/' not in self.driver.current_url:
             self.driver.get(self.server_url)
@@ -381,7 +466,7 @@ class PellaAutoRenew:
             
             if not restart_btn:
                 logger.warning("⚠️ 未找到 RESTART 按钮")
-                return False, ""
+                return False, "未找到 RESTART 按钮"
             
             self.driver.execute_script("arguments[0].scrollIntoView(true);", restart_btn)
             time.sleep(0.5)
@@ -396,11 +481,11 @@ class PellaAutoRenew:
                 return True, output
             else:
                 logger.warning("⚠️ 未获取到重启输出")
-                return False, ""
+                return False, "未获取到重启输出"
                 
         except Exception as e:
             logger.error(f"❌ 重启失败: {e}")
-            return False, ""
+            return False, f"重启失败: {e}"
 
     def _wait_for_restart_output(self):
         """等待重启输出完成并返回输出内容"""
@@ -529,7 +614,7 @@ class MultiAccountManager:
         raise ValueError("❌ 未找到账号配置")
     
     def send_notification(self, results):
-        """发送通知 - 每个账号单独一条消息，日志作为文件"""
+        """发送通知 - 每个账号单独一条消息"""
         if not self.tg_token or not self.tg_chat:
             return
         
@@ -541,7 +626,7 @@ class MultiAccountManager:
                 logger.error(f"❌ 发送 {mask_email(email)} 通知失败: {e}")
     
     def _send_single_notification(self, email, success, result, restart_output):
-        """发送单个账号的通知 - 简洁消息 + 日志文件"""
+        """发送单个账号的通知"""
         try:
             # 确定状态图标
             if "成功" in result:
@@ -552,11 +637,14 @@ class MultiAccountManager:
                 status = "❌"
             
             # 确定重启状态
-            if restart_output:
-                if "App is running" in restart_output or "running" in restart_output.lower():
-                    restart_status = "✅ 完成"
-                else:
-                    restart_status = "⚠️ 未确认"
+            if "跳过: 服务器正在运行" in restart_output:
+                restart_status = "✅ 运行中(无需重启)"
+            elif "跳过" in restart_output:
+                restart_status = f"⏭️ {restart_output}"
+            elif restart_output and ("App is running" in restart_output or "running" in restart_output.lower()):
+                restart_status = "✅ 重启完成"
+            elif restart_output:
+                restart_status = "⚠️ 未确认"
             else:
                 restart_status = "⚠️ 无输出"
             
@@ -579,8 +667,8 @@ class MultiAccountManager:
                 logger.info(f"✅ {mask_email(email)} 消息已发送")
                 message_id = response.json().get('result', {}).get('message_id')
                 
-                # 如果有日志，作为文件发送（回复主消息）
-                if restart_output and len(restart_output) > 50:
+                # 如果有实际的重启日志（不是跳过消息），作为文件发送
+                if restart_output and len(restart_output) > 50 and "跳过" not in restart_output:
                     self._send_log_file(email, restart_output, message_id)
             else:
                 logger.warning(f"⚠️ 发送失败: {response.text}")
@@ -593,26 +681,22 @@ class MultiAccountManager:
         try:
             import io
             
-            # 创建文件内容
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"restart_log_{timestamp}.txt"
             
-            # 添加头部信息
             file_content = f"Pella 重启日志\n"
             file_content += f"账号: {email}\n"
             file_content += f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             file_content += "=" * 50 + "\n\n"
             file_content += log_content
             
-            # 创建文件对象
             file_obj = io.BytesIO(file_content.encode('utf-8'))
             file_obj.name = filename
             
-            # 发送文件
             data = {
                 "chat_id": self.tg_chat,
                 "caption": "📜 重启日志",
-                "disable_notification": True  # 静音发送
+                "disable_notification": True
             }
             
             if reply_to_message_id:
