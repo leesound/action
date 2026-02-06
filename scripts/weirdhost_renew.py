@@ -238,26 +238,86 @@ def check_turnstile_solved(sb):
 
 
 def get_turnstile_coords(sb):
+    """获取 Turnstile iframe 坐标 - 改进版"""
     try:
         return sb.execute_script("""
-            var iframes = document.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-                var src = iframes[i].src || '';
-                if (src.includes('cloudflare') || src.includes('turnstile')) {
-                    var rect = iframes[i].getBoundingClientRect();
+            // 方法1: 通过 cf-turnstile div 找
+            var cfDiv = document.querySelector('[class*="cf-turnstile"]');
+            if (cfDiv) {
+                var iframe = cfDiv.querySelector('iframe');
+                if (iframe) {
+                    var rect = iframe.getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
                         return {
                             x: rect.x, y: rect.y,
                             width: rect.width, height: rect.height,
                             click_x: Math.round(rect.x + 30),
-                            click_y: Math.round(rect.y + rect.height / 2)
+                            click_y: Math.round(rect.y + rect.height / 2),
+                            method: 'cf-div'
                         };
                     }
                 }
             }
+            
+            // 方法2: 通过 turnstile input 向上找
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input) {
+                var parent = input.parentElement;
+                for (var i = 0; i < 10; i++) {
+                    if (!parent) break;
+                    var iframe = parent.querySelector('iframe');
+                    if (iframe) {
+                        var rect = iframe.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                x: rect.x, y: rect.y,
+                                width: rect.width, height: rect.height,
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2),
+                                method: 'input-parent'
+                            };
+                        }
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            
+            // 方法3: 找所有 iframe，选择尺寸合适的 (约 300x65)
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                var rect = iframes[i].getBoundingClientRect();
+                // Turnstile 通常是 300x65 左右
+                if (rect.width >= 250 && rect.width <= 350 && 
+                    rect.height >= 50 && rect.height <= 100) {
+                    return {
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height,
+                        click_x: Math.round(rect.x + 30),
+                        click_y: Math.round(rect.y + rect.height / 2),
+                        method: 'size-match'
+                    };
+                }
+            }
+            
+            // 方法4: 找任何可见的 iframe
+            for (var i = 0; i < iframes.length; i++) {
+                var rect = iframes[i].getBoundingClientRect();
+                if (rect.width > 100 && rect.height > 30 && 
+                    rect.x > 0 && rect.y > 0) {
+                    return {
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height,
+                        click_x: Math.round(rect.x + 30),
+                        click_y: Math.round(rect.y + rect.height / 2),
+                        method: 'any-visible'
+                    };
+                }
+            }
+            
             return null;
         """)
-    except:
+    except Exception as e:
+        print(f"[!] get_turnstile_coords 异常: {e}")
         return None
 
 
