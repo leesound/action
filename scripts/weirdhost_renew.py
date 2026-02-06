@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Weirdhost 自动续期脚本 v9 - 简化版
-流程: 点击侧栏按钮 → Turnstile 通过后自动提交 → 检查结果
-"""
 
 import os
 import time
@@ -56,20 +52,23 @@ def calculate_remaining_time(expiry_str):
                 expiry_dt = datetime.strptime(expiry_str.strip(), fmt)
                 diff = expiry_dt - datetime.now()
                 if diff.total_seconds() < 0:
-                    return "已过期"
+                    return "⚠️ 已过期"
                 days = diff.days
                 hours = diff.seconds // 3600
+                minutes = (diff.seconds % 3600) // 60
                 parts = []
                 if days > 0:
                     parts.append(f"{days}天")
                 if hours > 0:
                     parts.append(f"{hours}小时")
-                return " ".join(parts) if parts else "不到1小时"
+                if minutes > 0 and days == 0:
+                    parts.append(f"{minutes}分钟")
+                return " ".join(parts) if parts else "不到1分钟"
             except ValueError:
                 continue
-        return "未知"
+        return "无法解析"
     except:
-        return "未知"
+        return "计算失败"
 
 
 def parse_expiry_to_datetime(expiry_str):
@@ -81,6 +80,10 @@ def parse_expiry_to_datetime(expiry_str):
         except ValueError:
             continue
     return None
+
+
+def random_delay(min_sec=0.5, max_sec=2.0):
+    time.sleep(random.uniform(min_sec, max_sec))
 
 
 # ============================================================
@@ -97,8 +100,8 @@ async def tg_notify(message):
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
             )
-        except:
-            pass
+        except Exception as e:
+            print(f"[TG] 发送失败: {e}")
 
 
 async def tg_notify_photo(photo_path, caption=""):
@@ -115,8 +118,8 @@ async def tg_notify_photo(photo_path, caption=""):
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
                 await session.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data)
-        except:
-            pass
+        except Exception as e:
+            print(f"[TG] 图片发送失败: {e}")
 
 
 def sync_tg_notify(message):
@@ -168,9 +171,13 @@ async def update_github_secret(secret_name, secret_value):
 # 页面解析
 # ============================================================
 def get_expiry_from_page(sb):
+    """从页面获取到期时间"""
     try:
         page_text = sb.get_page_source()
         match = re.search(r'유통기한\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', page_text)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', page_text)
         if match:
             return match.group(1).strip()
         return "Unknown"
@@ -179,11 +186,14 @@ def get_expiry_from_page(sb):
 
 
 def is_logged_in(sb):
+    """检查是否已登录"""
     try:
         url = sb.get_current_url()
         if "/login" in url or "/auth" in url:
             return False
         if get_expiry_from_page(sb) != "Unknown":
+            return True
+        if sb.is_element_present("//button//span[contains(text(), '시간추가')]"):
             return True
         return False
     except:
@@ -191,43 +201,62 @@ def is_logged_in(sb):
 
 
 # ============================================================
-# Turnstile 处理
+# Turnstile 处理 (核心)
 # ============================================================
 
+# 修复弹窗样式的 JS
 EXPAND_POPUP_JS = """
 (function() {
     var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!turnstileInput) return 'no turnstile';
-    
+    if (!turnstileInput) return 'no turnstile input';
+  
     var el = turnstileInput;
     for (var i = 0; i < 20; i++) {
         el = el.parentElement;
         if (!el) break;
-        el.style.overflow = 'visible';
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+            el.style.overflow = 'visible';
+        }
         el.style.minWidth = 'max-content';
     }
-    
-    document.querySelectorAll('[class*="sc-fKFyDc"], [class*="nwOmR"]').forEach(function(c) {
-        c.style.overflow = 'visible';
-        c.style.width = '300px';
-        c.style.minWidth = '300px';
+  
+    var turnstileContainers = document.querySelectorAll('[class*="sc-fKFyDc"], [class*="nwOmR"]');
+    turnstileContainers.forEach(function(container) {
+        container.style.overflow = 'visible';
+        container.style.width = '300px';
+        container.style.minWidth = '300px';
+        container.style.height = '65px';
     });
-    
+  
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+            iframe.style.width = '300px';
+            iframe.style.height = '65px';
+            iframe.style.minWidth = '300px';
+            iframe.style.visibility = 'visible';
+            iframe.style.opacity = '1';
+        }
+    });
+  
     return 'done';
 })();
 """
 
 
 def check_turnstile_exists(sb):
+    """检查页面是否有 Turnstile"""
     try:
-        return sb.execute_script(
-            "return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null;"
-        )
+        return sb.execute_script("""
+            return document.querySelector('input[name="cf-turnstile-response"]') !== null;
+        """)
     except:
         return False
 
 
 def check_turnstile_solved(sb):
+    """检查 Turnstile 是否已通过"""
     try:
         return sb.execute_script("""
             var input = document.querySelector('input[name="cf-turnstile-response"]');
@@ -237,110 +266,78 @@ def check_turnstile_solved(sb):
         return False
 
 
-def get_turnstile_coords(sb):
-    """获取 Turnstile iframe 坐标 - 改进版"""
+def get_turnstile_checkbox_coords(sb):
+    """获取 Turnstile checkbox 的坐标"""
     try:
-        return sb.execute_script("""
-            // 方法1: 通过 cf-turnstile div 找
-            var cfDiv = document.querySelector('[class*="cf-turnstile"]');
-            if (cfDiv) {
-                var iframe = cfDiv.querySelector('iframe');
-                if (iframe) {
-                    var rect = iframe.getBoundingClientRect();
+        coords = sb.execute_script("""
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                var src = iframes[i].src || '';
+                if (src.includes('cloudflare') || src.includes('turnstile')) {
+                    var rect = iframes[i].getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
                         return {
-                            x: rect.x, y: rect.y,
-                            width: rect.width, height: rect.height,
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
                             click_x: Math.round(rect.x + 30),
-                            click_y: Math.round(rect.y + rect.height / 2),
-                            method: 'cf-div'
+                            click_y: Math.round(rect.y + rect.height / 2)
                         };
                     }
                 }
             }
-            
-            // 方法2: 通过 turnstile input 向上找
+          
             var input = document.querySelector('input[name="cf-turnstile-response"]');
             if (input) {
-                var parent = input.parentElement;
-                for (var i = 0; i < 10; i++) {
-                    if (!parent) break;
-                    var iframe = parent.querySelector('iframe');
-                    if (iframe) {
-                        var rect = iframe.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            return {
-                                x: rect.x, y: rect.y,
-                                width: rect.width, height: rect.height,
-                                click_x: Math.round(rect.x + 30),
-                                click_y: Math.round(rect.y + rect.height / 2),
-                                method: 'input-parent'
-                            };
-                        }
+                var container = input.parentElement;
+                for (var j = 0; j < 5; j++) {
+                    if (!container) break;
+                    var rect = container.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 30) {
+                        return {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                            click_x: Math.round(rect.x + 30),
+                            click_y: Math.round(rect.y + rect.height / 2)
+                        };
                     }
-                    parent = parent.parentElement;
+                    container = container.parentElement;
                 }
             }
-            
-            // 方法3: 找所有 iframe，选择尺寸合适的 (约 300x65)
-            var iframes = document.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-                var rect = iframes[i].getBoundingClientRect();
-                // Turnstile 通常是 300x65 左右
-                if (rect.width >= 250 && rect.width <= 350 && 
-                    rect.height >= 50 && rect.height <= 100) {
-                    return {
-                        x: rect.x, y: rect.y,
-                        width: rect.width, height: rect.height,
-                        click_x: Math.round(rect.x + 30),
-                        click_y: Math.round(rect.y + rect.height / 2),
-                        method: 'size-match'
-                    };
-                }
-            }
-            
-            // 方法4: 找任何可见的 iframe
-            for (var i = 0; i < iframes.length; i++) {
-                var rect = iframes[i].getBoundingClientRect();
-                if (rect.width > 100 && rect.height > 30 && 
-                    rect.x > 0 && rect.y > 0) {
-                    return {
-                        x: rect.x, y: rect.y,
-                        width: rect.width, height: rect.height,
-                        click_x: Math.round(rect.x + 30),
-                        click_y: Math.round(rect.y + rect.height / 2),
-                        method: 'any-visible'
-                    };
-                }
-            }
-            
+          
             return null;
         """)
-    except Exception as e:
-        print(f"[!] get_turnstile_coords 异常: {e}")
+        return coords
+    except:
         return None
 
 
 def xdotool_click(x, y):
+    """使用 xdotool 进行物理点击"""
     try:
         subprocess.run(["xdotool", "mousemove", "--sync", str(int(x)), str(int(y))], 
                       check=True, timeout=5)
         time.sleep(0.1)
         subprocess.run(["xdotool", "click", "1"], check=True, timeout=5)
         return True
-    except:
+    except Exception as e:
+        print(f"[!] xdotool 点击失败: {e}")
         return False
 
 
-def click_turnstile(sb):
-    """点击 Turnstile checkbox"""
-    coords = get_turnstile_coords(sb)
+def click_turnstile_checkbox(sb):
+    """使用 xdotool 点击 Turnstile checkbox"""
+    coords = get_turnstile_checkbox_coords(sb)
     if not coords:
         print("[!] 无法获取 Turnstile 坐标")
         return False
-    
-    print(f"[*] Turnstile: ({coords['x']:.0f}, {coords['y']:.0f}) {coords['width']:.0f}x{coords['height']:.0f}")
-    
+  
+    print(f"[*] Turnstile 位置: ({coords['x']:.0f}, {coords['y']:.0f}) "
+          f"{coords['width']:.0f}x{coords['height']:.0f}")
+  
     try:
         window_info = sb.execute_script("""
             return {
@@ -350,123 +347,196 @@ def click_turnstile(sb):
                 innerHeight: window.innerHeight
             };
         """)
-        
-        chrome_bar = window_info["outerHeight"] - window_info["innerHeight"]
+      
+        chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
         abs_x = coords["click_x"] + window_info["screenX"]
-        abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar
-        
-        print(f"[*] 点击: ({abs_x:.0f}, {abs_y:.0f})")
+        abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
+      
+        print(f"[*] 点击坐标: ({abs_x:.0f}, {abs_y:.0f})")
         return xdotool_click(abs_x, abs_y)
+    except Exception as e:
+        print(f"[!] 坐标计算失败: {e}")
+        return False
+
+
+# ============================================================
+# 结果检测
+# ============================================================
+
+def check_success_popup(sb):
+    """检查是否出现成功弹窗 (성공!)"""
+    try:
+        page = sb.get_page_source()
+        # 检查成功关键词
+        success_keywords = ["성공", "Success", "successfully"]
+        for kw in success_keywords:
+            if kw.lower() in page.lower():
+                return True
+        return False
     except:
         return False
 
 
-def check_result_popup(sb):
-    """检查结果弹窗 - 返回 'success' / 'cooldown' / None"""
+def check_cooldown_popup(sb):
+    """检查是否出现冷却期弹窗 (아직...)"""
     try:
-        page = sb.get_page_source()
-        
-        # 成功
-        if "successfully renew" in page.lower() or "성공" in page:
-            if "Success" in page:
-                return "success"
-        
-        # 冷却期
         cooldown_texts = [
-            "아직 연장을 할수없어요",
-            "아직 서버를 갱신할 수 없습니다",
-            "남은 시간이 더 줄어들 때까지"
+            "아직",
+            "연장을 할수없어요",
+            "갱신할 수 없습니다",
+            "남은 시간이 더 줄어들"
         ]
+        page = sb.get_page_source()
         for text in cooldown_texts:
             if text in page:
-                return "cooldown"
-        
-        # Error 弹窗
-        if sb.is_element_present("//span[contains(@class, 'title') and text()='Error']"):
-            return "cooldown"
-        
-        return None
+                return True
+        return False
     except:
-        return None
+        return False
+
+
+def click_next_button(sb):
+    """点击 NEXT 按钮关闭结果弹窗"""
+    try:
+        next_selectors = [
+            "//button[contains(text(), 'NEXT')]",
+            "//button[contains(text(), 'Next')]",
+            "//button//span[contains(text(), 'NEXT')]",
+        ]
+        for sel in next_selectors:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                print("[+] 已点击 NEXT 按钮")
+                return True
+    except:
+        pass
+    return False
 
 
 # ============================================================
 # 主流程
 # ============================================================
 
-def handle_turnstile_and_wait(sb, timeout=60):
+def handle_renewal_popup(sb, timeout=90):
     """
-    处理 Turnstile 并等待结果
-    Turnstile 通过后会自动提交，只需等待结果弹窗
+    处理续期弹窗流程:
+    1. 等待弹窗和 Turnstile 出现
+    2. 修复弹窗样式
+    3. 点击 Turnstile checkbox
+    4. Turnstile 通过 → 自动提交
+    5. 等待结果 (Success/Cooldown)
     """
-    start = time.time()
-    
-    # 1. 等待 Turnstile 出现
-    print("[*] 等待 Turnstile...")
-    for _ in range(15):
+    start_time = time.time()
+  
+    # ========== 阶段1: 等待弹窗和 Turnstile ==========
+    print("\n[阶段1] 等待弹窗和 Turnstile...")
+  
+    turnstile_ready = False
+    for _ in range(20):
         if check_turnstile_exists(sb):
-            print("[+] Turnstile 已出现")
+            turnstile_ready = True
+            print("[+] 检测到 Turnstile")
             break
-        if check_result_popup(sb):
-            return check_result_popup(sb)
+      
+        if check_cooldown_popup(sb):
+            print("[*] 检测到冷却期弹窗")
+            sb.save_screenshot("popup_fixed.png")
+            return {"status": "cooldown"}
+      
         time.sleep(1)
-    else:
+  
+    if not turnstile_ready:
         print("[!] 未检测到 Turnstile")
-        return None
-    
-    # 2. 修复弹窗样式
-    print("[*] 修复弹窗样式...")
-    for _ in range(2):
-        sb.execute_script(EXPAND_POPUP_JS)
-        time.sleep(0.3)
-    
+        sb.save_screenshot("popup_fixed.png")
+        return {"status": "error", "message": "未检测到 Turnstile"}
+  
+    # ========== 阶段2: 修复弹窗样式 ==========
+    print("\n[阶段2] 修复弹窗样式...")
+  
+    for _ in range(3):
+        result = sb.execute_script(EXPAND_POPUP_JS)
+        print(f"[*] 样式修复: {result}")
+        time.sleep(0.5)
+  
     sb.save_screenshot("popup_fixed.png")
-    
-    # 3. 点击 Turnstile
-    print("[*] 点击 Turnstile...")
-    for attempt in range(5):
-        print(f"  尝试 {attempt + 1}/5")
-        
+  
+    # ========== 阶段3: 点击 Turnstile → 自动提交 ==========
+    print("\n[阶段3] 点击 Turnstile checkbox...")
+  
+    turnstile_solved = False
+  
+    for attempt in range(6):
+        print(f"\n  --- 尝试 {attempt + 1}/6 ---")
+      
+        # 检查是否已通过
         if check_turnstile_solved(sb):
             print("[+] Turnstile 已通过!")
+            turnstile_solved = True
             break
-        
+      
+        # 修复样式
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.3)
-        click_turnstile(sb)
-        
+      
+        # xdotool 点击
+        click_turnstile_checkbox(sb)
+      
         # 等待验证
-        for _ in range(6):
+        print("[*] 等待 Turnstile 验证...")
+        for _ in range(8):
             time.sleep(0.5)
             if check_turnstile_solved(sb):
                 print("[+] Turnstile 已通过!")
+                turnstile_solved = True
                 break
-            # 检查是否已有结果
-            result = check_result_popup(sb)
-            if result:
-                return result
-        
-        if check_turnstile_solved(sb):
+            # 检查是否已出现结果（自动提交成功）
+            if check_success_popup(sb) or check_cooldown_popup(sb):
+                print("[+] 检测到结果弹窗，已自动提交")
+                turnstile_solved = True
+                break
+      
+        if turnstile_solved:
             break
-    
-    # 4. 等待结果弹窗 (Turnstile 通过后自动提交)
-    print("[*] 等待结果...")
-    remaining = timeout - (time.time() - start)
-    
-    for _ in range(int(remaining)):
-        result = check_result_popup(sb)
-        if result:
-            print(f"[+] 结果: {result}")
-            sb.save_screenshot("result.png")
-            return result
+      
+        sb.save_screenshot(f"turnstile_attempt_{attempt}.png")
+  
+    if not turnstile_solved:
+        print("[!] Turnstile 未能通过验证")
+        sb.save_screenshot("popup_fixed.png")
+        return {"status": "error", "message": "Turnstile 未通过"}
+  
+    # ========== 阶段4: 等待结果 (自动提交后) ==========
+    print("\n[阶段4] 等待结果...")
+  
+    result_timeout = 30
+    result_start = time.time()
+  
+    while time.time() - result_start < result_timeout:
+        # 检查成功 (성공!)
+        if check_success_popup(sb):
+            print("[+] 检测到成功弹窗 (성공!)")
+            sb.save_screenshot("popup_fixed.png")
+            time.sleep(1)
+            click_next_button(sb)
+            return {"status": "success"}
+      
+        # 检查冷却期 (아직...)
+        if check_cooldown_popup(sb):
+            print("[*] 检测到冷却期弹窗 (아직...)")
+            sb.save_screenshot("popup_fixed.png")
+            time.sleep(1)
+            click_next_button(sb)
+            return {"status": "cooldown"}
+      
         time.sleep(1)
-    
-    print("[!] 等待超时")
-    sb.save_screenshot("timeout.png")
-    return "timeout"
+  
+    print("[!] 等待结果超时")
+    sb.save_screenshot("popup_fixed.png")
+    return {"status": "timeout"}
 
 
 def add_server_time():
+    """主函数"""
     weirdhost_cookie = os.environ.get("WEIRDHOST_COOKIE", "").strip()
     weirdhost_id = os.environ.get("WEIRDHOST_ID", "").strip()
 
@@ -474,7 +544,7 @@ def add_server_time():
     server_url = build_server_url(weirdhost_id)
 
     if not cookie_name or not cookie_value:
-        sync_tg_notify("🎁 <b>Weirdhost</b>\n\n❌ WEIRDHOST_COOKIE 未设置")
+        sync_tg_notify("🎁 <b>Weirdhost</b>\n\n❌ WEIRDHOST_COOKIE 未设置或格式错误")
         return
     if not server_url:
         sync_tg_notify("🎁 <b>Weirdhost</b>\n\n❌ WEIRDHOST_ID 未设置")
@@ -483,6 +553,7 @@ def add_server_time():
     print("=" * 60)
     print("Weirdhost 自动续期 v9")
     print("=" * 60)
+    print(f"[*] Cookie: {cookie_name}")
     print(f"[*] URL: {server_url}")
     print("=" * 60)
 
@@ -492,7 +563,7 @@ def add_server_time():
         with SB(uc=True, test=True, locale="ko", headless=False) as sb:
             print("\n[*] 浏览器已启动")
 
-            # 步骤1: 设置 Cookie
+            # ===== 步骤1: 设置 Cookie =====
             print("\n[步骤1] 设置 Cookie")
             sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
             time.sleep(2)
@@ -500,8 +571,9 @@ def add_server_time():
                 "name": cookie_name, "value": cookie_value,
                 "domain": DOMAIN, "path": "/"
             })
+            print("[+] Cookie 已设置")
 
-            # 步骤2: 访问服务器页面
+            # ===== 步骤2: 访问服务器页面 =====
             print("\n[步骤2] 访问服务器页面")
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
@@ -515,111 +587,122 @@ def add_server_time():
                 time.sleep(3)
 
             if not is_logged_in(sb):
-                sb.save_screenshot("login_failed.png")
-                sync_tg_notify_photo("login_failed.png",
-                    "🎁 <b>Weirdhost</b>\n\n❌ Cookie 失效")
+                sb.save_screenshot("popup_fixed.png")
+                sync_tg_notify_photo("popup_fixed.png",
+                    "🎁 <b>Weirdhost</b>\n\n❌ Cookie 失效，请更新")
                 return
 
             print("[+] 登录成功")
+
             original_expiry = get_expiry_from_page(sb)
-            original_remaining = calculate_remaining_time(original_expiry)
-            print(f"[*] 到期: {original_expiry} ({original_remaining})")
+            remaining = calculate_remaining_time(original_expiry)
+            print(f"[*] 到期: {original_expiry}")
+            print(f"[*] 剩余: {remaining}")
 
-            # 步骤3: 点击续期按钮
-            print("\n[步骤3] 点击续期按钮")
-            time.sleep(random.uniform(1, 2))
+            # ===== 步骤3: 点击侧栏续期按钮 =====
+            print("\n[步骤3] 点击侧栏续期按钮")
+            random_delay(1.0, 2.0)
 
-            btn_xpath = "//button[contains(., '시간추가')]"
-            if not sb.is_element_present(btn_xpath):
-                sb.save_screenshot("no_button.png")
-                sync_tg_notify_photo("no_button.png",
-                    f"🎁 <b>Weirdhost</b>\n\n⚠️ 未找到按钮\n📅 {original_expiry}")
+            sidebar_btn_xpath = "//button//span[contains(text(), '시간추가')]/parent::button"
+            if not sb.is_element_present(sidebar_btn_xpath):
+                sidebar_btn_xpath = "//button[contains(., '시간추가')]"
+            
+            if not sb.is_element_present(sidebar_btn_xpath):
+                sb.save_screenshot("popup_fixed.png")
+                sync_tg_notify_photo("popup_fixed.png",
+                    f"🎁 <b>Weirdhost</b>\n\n⚠️ 未找到续期按钮\n📅 到期: {original_expiry}")
                 return
 
-            sb.click(btn_xpath)
-            print("[+] 已点击，等待弹窗...")
+            sb.click(sidebar_btn_xpath)
+            print("[+] 已点击侧栏按钮，等待弹窗...")
             time.sleep(3)
 
-            # 步骤4: 处理 Turnstile
-            print("\n[步骤4] 处理 Turnstile")
-            result = handle_turnstile_and_wait(sb, timeout=60)
-            print(f"[*] 结果: {result}")
+            # ===== 步骤4: 处理续期弹窗 =====
+            print("\n[步骤4] 处理续期弹窗")
+            result = handle_renewal_popup(sb, timeout=90)
+            print(f"\n[*] 处理结果: {result}")
 
-            # 步骤5: 检查到期时间变化
-            print("\n[步骤5] 检查结果")
-            time.sleep(2)
+            # ===== 步骤5: 验证续期结果 =====
+            print("\n[步骤5] 验证续期结果")
+            time.sleep(3)
             
-            # 刷新页面
             sb.uc_open_with_reconnect(server_url, reconnect_time=3)
             time.sleep(3)
             
             new_expiry = get_expiry_from_page(sb)
             new_remaining = calculate_remaining_time(new_expiry)
-            sb.save_screenshot("final.png")
 
-            print(f"[*] 原: {original_expiry}")
-            print(f"[*] 新: {new_expiry}")
+            print(f"[*] 原到期: {original_expiry}")
+            print(f"[*] 新到期: {new_expiry}")
 
             original_dt = parse_expiry_to_datetime(original_expiry)
             new_dt = parse_expiry_to_datetime(new_expiry)
 
-            # 发送通知
-            if result == "cooldown":
-                msg = (f"🎁 <b>Weirdhost</b>\n\n"
-                       f"ℹ️ 冷却期内\n"
+            # ===== 发送 TG 通知 (附 popup_fixed.png) =====
+            if result["status"] == "cooldown":
+                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
+                       f"ℹ️ 冷却期内，暂时无法续期 (아직...)\n"
                        f"📅 到期: {original_expiry}\n"
-                       f"⏳ 剩余: {original_remaining}")
+                       f"⏳ 剩余: {remaining}")
+                sync_tg_notify_photo("popup_fixed.png", msg)
+                return
+
+            if result["status"] == "success" or (original_dt and new_dt and new_dt > original_dt):
+                diff_h = 0
+                if original_dt and new_dt:
+                    diff_h = (new_dt - original_dt).total_seconds() / 3600
+                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
+                       f"✅ 续期成功！(성공!)\n"
+                       f"📅 新到期: {new_expiry}\n"
+                       f"⏳ 剩余: {new_remaining}")
+                if diff_h > 0:
+                    msg += f"\n📝 延长了 {diff_h:.1f} 小时"
+                print(f"\n[+] 成功！")
                 sync_tg_notify_photo("popup_fixed.png", msg)
 
-            elif original_dt and new_dt and new_dt > original_dt:
-                diff_h = (new_dt - original_dt).total_seconds() / 3600
-                msg = (f"🎁 <b>Weirdhost</b>\n\n"
-                       f"✅ 续期成功!\n"
-                       f"📅 到期: {new_expiry}\n"
-                       f"⏳ 剩余: {new_remaining}\n"
-                       f"📝 +{diff_h:.1f}h")
-                print(f"\n[+] 成功! +{diff_h:.1f}h")
-                sync_tg_notify(msg)
-
             elif original_dt and new_dt and new_dt == original_dt:
-                msg = (f"🎁 <b>Weirdhost</b>\n\n"
-                       f"⚠️ 时间未变化\n"
+                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
+                       f"⚠️ 到期时间未变化\n"
                        f"📅 到期: {original_expiry}\n"
-                       f"⏳ 剩余: {original_remaining}\n"
-                       f"📝 状态: {result or 'unknown'}")
+                       f"⏳ 剩余: {remaining}\n"
+                       f"📝 状态: {result.get('status', 'unknown')}")
+                print("\n[*] 时间未变化")
                 sync_tg_notify_photo("popup_fixed.png", msg)
 
             else:
-                msg = (f"🎁 <b>Weirdhost</b>\n\n"
-                       f"⚠️ 结果未知\n"
-                       f"📅 原: {original_expiry}\n"
-                       f"📅 新: {new_expiry}\n"
-                       f"📝 状态: {result or 'unknown'}")
+                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
+                       f"⚠️ 结果待确认\n"
+                       f"📅 原到期: {original_expiry}\n"
+                       f"📅 新到期: {new_expiry}\n"
+                       f"📝 状态: {result.get('status', 'unknown')}")
                 sync_tg_notify_photo("popup_fixed.png", msg)
 
-            # 更新 Cookie
+            # ===== 步骤6: 更新 Cookie =====
             try:
-                for cookie in sb.get_cookies():
+                cookies = sb.get_cookies()
+                for cookie in cookies:
                     if cookie.get("name", "").startswith("remember_web"):
                         new_val = cookie.get("value", "")
                         if new_val and new_val != cookie_value:
-                            new_str = f"{cookie['name']}={new_val}"
-                            if asyncio.run(update_github_secret("WEIRDHOST_COOKIE", new_str)):
-                                print("[+] Cookie 已更新")
+                            new_cookie_str = f"{cookie['name']}={new_val}"
+                            print(f"\n[*] 检测到新 Cookie")
+                            if asyncio.run(update_github_secret("WEIRDHOST_COOKIE", new_cookie_str)):
+                                print("[+] Cookie 已自动更新到 GitHub Secrets")
                             break
-            except:
-                pass
+            except Exception as e:
+                print(f"[!] Cookie 更新检查失败: {e}")
 
     except Exception as e:
         import traceback
+        error_msg = f"🎁 <b>Weirdhost</b>\n\n❌ 脚本异常\n\n<code>{repr(e)}</code>"
+        print(f"\n[!] 异常: {repr(e)}")
         traceback.print_exc()
-        msg = f"🎁 <b>Weirdhost</b>\n\n❌ 异常\n<code>{repr(e)[:200]}</code>"
+
         if os.path.exists("popup_fixed.png"):
-            sync_tg_notify_photo("popup_fixed.png", msg)
+            sync_tg_notify_photo("popup_fixed.png", error_msg)
         else:
-            sync_tg_notify(msg)
+            sync_tg_notify(error_msg)
 
 
 if __name__ == "__main__":
     add_server_time()
-
