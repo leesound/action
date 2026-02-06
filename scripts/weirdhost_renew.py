@@ -286,6 +286,27 @@ def get_turnstile_checkbox_coords(sb):
                     }
                 }
             }
+          
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input) {
+                var container = input.parentElement;
+                for (var j = 0; j < 5; j++) {
+                    if (!container) break;
+                    var rect = container.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 30) {
+                        return {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                            click_x: Math.round(rect.x + 30),
+                            click_y: Math.round(rect.y + rect.height / 2)
+                        };
+                    }
+                    container = container.parentElement;
+                }
+            }
+          
             return null;
         """)
         return coords
@@ -341,87 +362,36 @@ def click_turnstile_checkbox(sb):
 # 结果检测 (修复版)
 # ============================================================
 
-def check_result_popup(sb):
+def check_success_popup(sb):
     """
-    检查结果弹窗 - 更精确的检测
-    返回: 'success', 'cooldown', 'none'
+    检查是否出现成功弹窗 (성공!)
+    注意：必须是结果弹窗，不是 Turnstile 验证通过
     """
     try:
-        # 使用 JS 检测弹窗内容，而不是整个页面
+        # 方法1: 检查 MessageBox 样式的成功弹窗
+        # 成功弹窗通常有特定的容器类
         result = sb.execute_script("""
-            // 查找可能的结果弹窗
-            var popups = document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="popup"], [class*="alert"]');
-            
-            // 也检查 SweetAlert 等常见弹窗库
-            var swalPopup = document.querySelector('.swal2-popup, .swal-modal, [class*="swal"]');
-            if (swalPopup) {
-                popups = [swalPopup];
-            }
-            
-            // 检查所有可能的弹窗
-            for (var i = 0; i < popups.length; i++) {
-                var text = popups[i].innerText || '';
-                
-                // 成功关键词 - 韩语 "성공" 
-                if (text.includes('성공') || text.includes('연장되었습니다') || text.includes('갱신되었습니다')) {
-                    return 'success';
-                }
-                
-                // 冷却期关键词 - 韩语 "아직"
-                if (text.includes('아직') || text.includes('연장을 할수없어요') || text.includes('남은 시간이')) {
-                    return 'cooldown';
+            // 检查是否有 MessageBox 类型的成功弹窗
+            var messageBoxes = document.querySelectorAll('[class*="MessageBox"], [class*="message-box"], [class*="modal"]');
+            for (var i = 0; i < messageBoxes.length; i++) {
+                var box = messageBoxes[i];
+                var text = box.innerText || '';
+                // 成功弹窗应该包含 Success 标题和成功相关内容
+                if (text.includes('Success') && (text.includes('성공') || text.includes('renew') || text.includes('갱신'))) {
+                    return true;
                 }
             }
             
-            // 检查整个 body 中是否有明显的结果提示（但要排除 Turnstile 区域）
-            var body = document.body.innerText || '';
-            
-            // 排除 Turnstile iframe 的内容
-            var turnstileArea = document.querySelector('[class*="turnstile"], iframe[src*="cloudflare"]');
-            if (turnstileArea) {
-                // 如果 Turnstile 还在显示，说明还没提交
-                var turnstileRect = turnstileArea.getBoundingClientRect();
-                if (turnstileRect.width > 0 && turnstileRect.height > 0) {
-                    // Turnstile 还可见，检查是否有覆盖在上面的结果弹窗
-                    var overlayPopup = document.querySelector('.swal2-container, [class*="overlay"]');
-                    if (!overlayPopup) {
-                        return 'none';  // 还没有结果弹窗
-                    }
-                }
-            }
-            
-            // 最后检查是否有成功/失败的文字出现在显眼位置
-            if (body.includes('성공') && !body.includes('인증')) {
-                return 'success';
-            }
-            if (body.includes('아직')) {
-                return 'cooldown';
-            }
-            
-            return 'none';
-        """)
-        return result
-    except:
-        return 'none'
-
-
-def check_popup_visible(sb):
-    """检查是否有弹窗覆盖在 Turnstile 上面（表示已提交）"""
-    try:
-        return sb.execute_script("""
-            // 检查是否有 SweetAlert 或类似的结果弹窗
-            var swal = document.querySelector('.swal2-container, .swal2-popup');
-            if (swal && swal.offsetParent !== null) {
-                return true;
-            }
-            
-            // 检查是否有其他模态框
-            var modals = document.querySelectorAll('[role="dialog"], [class*="modal-open"]');
-            for (var i = 0; i < modals.length; i++) {
-                var style = window.getComputedStyle(modals[i]);
-                if (style.display !== 'none' && style.visibility !== 'hidden') {
-                    var text = modals[i].innerText || '';
-                    if (text.includes('성공') || text.includes('아직') || text.includes('NEXT')) {
+            // 检查是否有绿色成功图标 + 成功消息
+            var successElements = document.querySelectorAll('[class*="success"], [class*="Success"]');
+            for (var j = 0; j < successElements.length; j++) {
+                var el = successElements[j];
+                // 排除 Turnstile iframe 内的元素
+                if (el.closest('iframe')) continue;
+                var text = el.innerText || '';
+                if (text.includes('성공') || text.includes('successfully')) {
+                    // 确保不是 Turnstile 相关
+                    if (!text.includes('Cloudflare') && !text.includes('verification')) {
                         return true;
                     }
                 }
@@ -429,88 +399,84 @@ def check_popup_visible(sb):
             
             return false;
         """)
+        
+        if result:
+            return True
+        
+        # 方法2: 检查页面中是否有明确的成功消息（排除 Turnstile）
+        page = sb.get_page_source()
+        
+        # 这些是真正的续期成功消息
+        success_patterns = [
+            "서버가 성공적으로",      # 服务器成功地...
+            "연장되었습니다",          # 已延长
+            "갱신되었습니다",          # 已更新
+            "successfully renew",     # 成功续期
+            "renewal successful",     # 续期成功
+        ]
+        
+        for pattern in success_patterns:
+            if pattern.lower() in page.lower():
+                return True
+        
+        return False
     except:
         return False
 
 
-def find_and_click_submit_button(sb):
-    """
-    查找并点击提交按钮（Turnstile 通过后需要点击的按钮）
-    """
-    print("[*] 查找提交按钮...")
-    
-    # 可能的提交按钮选择器
-    submit_selectors = [
-        # 韩语按钮
-        "//button[contains(text(), '확인')]",
-        "//button[contains(text(), '연장')]",
-        "//button[contains(text(), '갱신')]",
-        "//button[contains(text(), '제출')]",
-        "//button//span[contains(text(), '확인')]",
-        "//button//span[contains(text(), '연장')]",
-        
-        # 英语按钮
-        "//button[contains(text(), 'Submit')]",
-        "//button[contains(text(), 'Confirm')]",
-        "//button[contains(text(), 'Renew')]",
-        "//button[contains(text(), 'Extend')]",
-        "//button[contains(text(), 'OK')]",
-        
-        # 通用按钮（在弹窗内）
-        "//div[contains(@class, 'modal')]//button[contains(@class, 'primary')]",
-        "//div[contains(@class, 'modal')]//button[contains(@class, 'submit')]",
-        "//form//button[@type='submit']",
-        
-        # SweetAlert 按钮
-        "//button[contains(@class, 'swal2-confirm')]",
-    ]
-    
-    for selector in submit_selectors:
-        try:
-            if sb.is_element_visible(selector):
-                print(f"[+] 找到提交按钮: {selector}")
-                sb.click(selector)
-                return True
-        except:
-            continue
-    
-    # 尝试用 JS 查找
+def check_cooldown_popup(sb):
+    """检查是否出现冷却期弹窗 (아직...)"""
     try:
-        clicked = sb.execute_script("""
-            // 查找弹窗内的按钮
-            var popup = document.querySelector('[role="dialog"], [class*="modal"], [class*="popup"]');
-            if (popup) {
-                var buttons = popup.querySelectorAll('button');
-                for (var i = 0; i < buttons.length; i++) {
-                    var btn = buttons[i];
-                    var text = btn.innerText || '';
-                    // 排除取消按钮
-                    if (text.includes('취소') || text.includes('Cancel') || text.includes('Close')) {
-                        continue;
+        cooldown_texts = [
+            "아직 연장을 할수없어요",
+            "아직 서버를 갱신할 수 없습니다",
+            "남은 시간이 더 줄어들",
+            "아직",  # 放在最后，作为兜底
+        ]
+        page = sb.get_page_source()
+        for text in cooldown_texts:
+            if text in page:
+                # 确保是在弹窗中，不是其他地方
+                # 检查是否有 Error 类型的 MessageBox
+                if sb.execute_script("""
+                    var boxes = document.querySelectorAll('[class*="MessageBox"], [class*="modal"]');
+                    for (var i = 0; i < boxes.length; i++) {
+                        if (boxes[i].innerText.includes('아직')) return true;
                     }
-                    // 点击确认/提交按钮
-                    if (text.includes('확인') || text.includes('연장') || text.includes('OK') || 
-                        text.includes('Submit') || text.includes('Confirm')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                // 如果只有一个按钮，点击它
-                if (buttons.length === 1) {
-                    buttons[0].click();
+                    return false;
+                """):
+                    return True
+                # 如果明确包含冷却期消息，也返回 true
+                if "연장을 할수없어요" in page or "갱신할 수 없습니다" in page:
+                    return True
+        return False
+    except:
+        return False
+
+
+def check_result_popup_appeared(sb):
+    """检查是否出现了结果弹窗（成功或失败）"""
+    try:
+        # 检查是否有 NEXT 按钮（结果弹窗通常有这个按钮）
+        if sb.is_element_visible("//button[contains(text(), 'NEXT')]"):
+            return True
+        if sb.is_element_visible("//button[contains(text(), 'Next')]"):
+            return True
+        
+        # 检查 MessageBox
+        result = sb.execute_script("""
+            var boxes = document.querySelectorAll('[class*="MessageBox"]');
+            for (var i = 0; i < boxes.length; i++) {
+                var text = boxes[i].innerText || '';
+                if (text.includes('Success') || text.includes('Error') || text.includes('성공') || text.includes('아직')) {
                     return true;
                 }
             }
             return false;
         """)
-        if clicked:
-            print("[+] 通过 JS 点击了提交按钮")
-            return True
+        return result
     except:
-        pass
-    
-    print("[!] 未找到提交按钮")
-    return False
+        return False
 
 
 def click_next_button(sb):
@@ -519,19 +485,53 @@ def click_next_button(sb):
         next_selectors = [
             "//button[contains(text(), 'NEXT')]",
             "//button[contains(text(), 'Next')]",
-            "//button[contains(text(), '확인')]",
-            "//button[contains(text(), 'OK')]",
             "//button//span[contains(text(), 'NEXT')]",
-            "//button[contains(@class, 'swal2-confirm')]",
         ]
         for sel in next_selectors:
             if sb.is_element_visible(sel):
                 sb.click(sel)
-                print("[+] 已点击关闭按钮")
+                print("[+] 已点击 NEXT 按钮")
                 return True
     except:
         pass
     return False
+
+
+def click_popup_submit_button(sb):
+    """点击弹窗内的 시간추가 提交按钮"""
+    try:
+        # 查找弹窗内的 시간추가 按钮
+        result = sb.execute_script("""
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var btn = buttons[i];
+                var text = btn.innerText || '';
+                
+                // 必须包含 시간추가
+                if (!text.includes('시간추가')) continue;
+                
+                // 排除包含 DELETE 的按钮
+                if (text.toUpperCase().includes('DELETE')) continue;
+                
+                // 检查位置 - 弹窗按钮 x > 200
+                var rect = btn.getBoundingClientRect();
+                if (rect.x > 200 && rect.width > 0) {
+                    btn.click();
+                    return {success: true, x: rect.x, y: rect.y};
+                }
+            }
+            return {success: false};
+        """)
+        
+        if result and result.get("success"):
+            print(f"[+] 已点击弹窗内 시간추가 按钮 (x={result['x']:.0f})")
+            return True
+        
+        print("[!] 未找到弹窗内的 시간추가 按钮")
+        return False
+    except Exception as e:
+        print(f"[!] 点击提交按钮失败: {e}")
+        return False
 
 
 # ============================================================
@@ -544,8 +544,8 @@ def handle_renewal_popup(sb, timeout=90):
     1. 等待弹窗和 Turnstile 出现
     2. 修复弹窗样式
     3. 点击 Turnstile checkbox
-    4. Turnstile 通过后，点击提交按钮
-    5. 等待结果 (Success/Cooldown)
+    4. Turnstile 通过后，点击弹窗内 시간추가 按钮
+    5. 等待结果弹窗 (Success/Cooldown)
     """
     start_time = time.time()
   
@@ -554,21 +554,16 @@ def handle_renewal_popup(sb, timeout=90):
   
     turnstile_ready = False
     for _ in range(20):
-        # 先检查是否已经有结果弹窗（可能不需要 Turnstile）
-        result = check_result_popup(sb)
-        if result == 'cooldown':
-            print("[*] 检测到冷却期弹窗")
-            sb.save_screenshot("popup_fixed.png")
-            return {"status": "cooldown"}
-        if result == 'success':
-            print("[+] 检测到成功弹窗")
-            sb.save_screenshot("popup_fixed.png")
-            return {"status": "success"}
-        
         if check_turnstile_exists(sb):
             turnstile_ready = True
             print("[+] 检测到 Turnstile")
             break
+      
+        # 检查是否直接显示冷却期（无需 Turnstile）
+        if check_cooldown_popup(sb):
+            print("[*] 检测到冷却期弹窗")
+            sb.save_screenshot("popup_fixed.png")
+            return {"status": "cooldown"}
       
         time.sleep(1)
   
@@ -581,10 +576,11 @@ def handle_renewal_popup(sb, timeout=90):
     print("\n[阶段2] 修复弹窗样式...")
   
     for _ in range(3):
-        sb.execute_script(EXPAND_POPUP_JS)
+        result = sb.execute_script(EXPAND_POPUP_JS)
+        print(f"[*] 样式修复: {result}")
         time.sleep(0.5)
   
-    sb.save_screenshot("turnstile_before.png")
+    sb.save_screenshot("popup_fixed.png")
   
     # ========== 阶段3: 点击 Turnstile ==========
     print("\n[阶段3] 点击 Turnstile checkbox...")
@@ -626,18 +622,49 @@ def handle_renewal_popup(sb, timeout=90):
         sb.save_screenshot("popup_fixed.png")
         return {"status": "error", "message": "Turnstile 未通过"}
   
-    # ========== 阶段4: 点击提交按钮 ==========
-    print("\n[阶段4] 点击提交按钮...")
+    # ========== 阶段4: 点击弹窗内 시간추가 按钮 ==========
+    print("\n[阶段4] 点击弹窗内 시간추가 按钮...")
     
-    sb.save_screenshot("turnstile_passed.png")
-    time.sleep(1)
+    time.sleep(1)  # 等待 Turnstile 动画完成
+    sb.save_screenshot("after_turnstile.png")
     
-    # 尝试点击提交按钮
-    submit_clicked = find_and_click_submit_button(sb)
-    
-    if not submit_clicked:
-        print("[!] 未找到提交按钮，尝试等待自动提交...")
-    
+    if not click_popup_submit_button(sb):
+        # 尝试用 xdotool 点击
+        print("[*] 尝试 xdotool 点击提交按钮...")
+        btn_coords = sb.execute_script("""
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var btn = buttons[i];
+                var text = btn.innerText || '';
+                if (text.includes('시간추가') && !text.toUpperCase().includes('DELETE')) {
+                    var rect = btn.getBoundingClientRect();
+                    if (rect.x > 200) {
+                        return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                    }
+                }
+            }
+            return null;
+        """)
+        
+        if btn_coords:
+            window_info = sb.execute_script("""
+                return {
+                    screenX: window.screenX || 0,
+                    screenY: window.screenY || 0,
+                    outerHeight: window.outerHeight,
+                    innerHeight: window.innerHeight
+                };
+            """)
+            chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
+            abs_x = btn_coords["x"] + window_info["screenX"]
+            abs_y = btn_coords["y"] + window_info["screenY"] + chrome_bar_height
+            print(f"[*] 提交按钮坐标: ({abs_x:.0f}, {abs_y:.0f})")
+            xdotool_click(abs_x, abs_y)
+        else:
+            print("[!] 未能点击提交按钮")
+            sb.save_screenshot("popup_fixed.png")
+            return {"status": "error", "message": "未能点击提交按钮"}
+  
     # ========== 阶段5: 等待结果 ==========
     print("\n[阶段5] 等待结果...")
   
@@ -645,26 +672,25 @@ def handle_renewal_popup(sb, timeout=90):
     result_start = time.time()
   
     while time.time() - result_start < result_timeout:
-        result = check_result_popup(sb)
-        
-        if result == 'success':
-            print("[+] 检测到成功弹窗 (성공!)")
+        # 先检查是否有结果弹窗出现
+        if check_result_popup_appeared(sb):
             sb.save_screenshot("popup_fixed.png")
-            time.sleep(1)
-            click_next_button(sb)
-            return {"status": "success"}
-      
-        if result == 'cooldown':
-            print("[*] 检测到冷却期弹窗 (아직...)")
-            sb.save_screenshot("popup_fixed.png")
-            time.sleep(1)
-            click_next_button(sb)
-            return {"status": "cooldown"}
-        
-        # 检查是否有新弹窗出现
-        if check_popup_visible(sb):
-            print("[*] 检测到弹窗，检查内容...")
-            sb.save_screenshot("popup_detected.png")
+            
+            # 检查是成功还是冷却期
+            if check_success_popup(sb):
+                print("[+] 检测到成功弹窗 (성공!)")
+                time.sleep(1)
+                click_next_button(sb)
+                return {"status": "success"}
+            
+            if check_cooldown_popup(sb):
+                print("[*] 检测到冷却期弹窗 (아직...)")
+                time.sleep(1)
+                click_next_button(sb)
+                return {"status": "cooldown"}
+            
+            # 有弹窗但无法判断类型
+            print("[*] 检测到弹窗，等待内容加载...")
       
         time.sleep(1)
   
@@ -779,41 +805,38 @@ def add_server_time():
             # ===== 发送 TG 通知 =====
             if result["status"] == "cooldown":
                 msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
-                       f"ℹ️ 冷却期内，暂时无法续期\n"
+                       f"ℹ️ 冷却期内，暂时无法续期 (아직...)\n"
                        f"📅 到期: {original_expiry}\n"
                        f"⏳ 剩余: {remaining}")
                 sync_tg_notify_photo("popup_fixed.png", msg)
                 return
 
-            # 判断是否真正成功（到期时间有变化）
-            time_extended = original_dt and new_dt and new_dt > original_dt
-            
-            if time_extended:
+            if original_dt and new_dt and new_dt > original_dt:
                 diff_h = (new_dt - original_dt).total_seconds() / 3600
                 msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
-                       f"✅ 续期成功！\n"
+                       f"✅ 续期成功！(성공!)\n"
                        f"📅 新到期: {new_expiry}\n"
                        f"⏳ 剩余: {new_remaining}\n"
                        f"📝 延长了 {diff_h:.1f} 小时")
-                print(f"\n[+] 成功！延长了 {diff_h:.1f} 小时")
+                print(f"\n[+] 成功！延长 {diff_h:.1f} 小时")
                 sync_tg_notify_photo("popup_fixed.png", msg)
 
-            elif result["status"] == "success" and not time_extended:
-                # 脚本认为成功但时间没变 - 可能是误判
+            elif result["status"] == "success":
+                # 状态显示成功但时间未变化，可能是页面更新延迟
                 msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
-                       f"⚠️ 状态异常：检测到成功但时间未变\n"
+                       f"✅ 操作完成 (성공!)\n"
+                       f"📅 到期: {new_expiry}\n"
+                       f"⏳ 剩余: {new_remaining}\n"
+                       f"📝 请确认时间是否更新")
+                sync_tg_notify_photo("popup_fixed.png", msg)
+
+            elif original_dt and new_dt and new_dt == original_dt:
+                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
+                       f"⚠️ 到期时间未变化\n"
                        f"📅 到期: {original_expiry}\n"
                        f"⏳ 剩余: {remaining}\n"
-                       f"📝 可能处于冷却期")
-                print("\n[!] 检测到成功但时间未变化")
-                sync_tg_notify_photo("popup_fixed.png", msg)
-
-            elif result["status"] == "timeout":
-                msg = (f"🎁 <b>Weirdhost 续订报告</b>\n\n"
-                       f"⚠️ 等待结果超时\n"
-                       f"📅 原到期: {original_expiry}\n"
-                       f"📅 新到期: {new_expiry}\n"
-                       f"📝 请检查截图确认状态")
+                       f"📝 状态: {result.get('status', 'unknown')}")
+                print("\n[*] 时间未变化")
                 sync_tg_notify_photo("popup_fixed.png", msg)
 
             else:
