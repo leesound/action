@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Weirdhost 自动续期脚本 v9
-完整流程:
-1. 点击侧栏 시간추가 → 弹窗出现
-2. 弹窗内有 Turnstile + 시간추가/DELETE 按钮
-3. 点击 Turnstile checkbox 打勾
-4. Turnstile 通过后可能自动提交，或需手动点击 시간추가
-5. 等待结果弹窗 (Success 绿色 / Error 红色冷却期)
-6. 点击 NEXT 关闭结果弹窗
-"""
 
 import os
 import time
