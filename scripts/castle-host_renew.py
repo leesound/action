@@ -47,7 +47,6 @@ class ServerResult:
     expiry: str = ""
     days: int = 0
     started: bool = False
-    console_log: str = ""
 
 
 @dataclass
@@ -121,43 +120,11 @@ class Notifier:
                 ) as r:
                     if r.status == 200:
                         logger.info("✅ 通知已发送")
-                        data = await r.json()
-                        return data.get('result', {}).get('message_id')
-                    else:
-                        text = await r.text()
-                        logger.error(f"❌ 通知失败: {text}")
+                        return (await r.json()).get('result', {}).get('message_id')
+                    logger.error(f"❌ 通知失败: {await r.text()}")
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
         return None
-
-    async def send_file(self, content: str, filename: str, caption: str = "", reply_to: int = None) -> bool:
-        if not self.token or not self.chat_id:
-            return False
-        try:
-            file_obj = io.BytesIO(content.encode('utf-8'))
-            async with aiohttp.ClientSession() as s:
-                data = aiohttp.FormData()
-                data.add_field('chat_id', str(self.chat_id))
-                data.add_field('document', file_obj, filename=filename, content_type='text/plain')
-                if caption:
-                    data.add_field('caption', caption)
-                if reply_to:
-                    data.add_field('reply_to_message_id', str(reply_to))
-
-                async with s.post(
-                    f"https://api.telegram.org/bot{self.token}/sendDocument",
-                    data=data,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as r:
-                    if r.status == 200:
-                        logger.info("✅ 文件已发送")
-                        return True
-                    else:
-                        text = await r.text()
-                        logger.error(f"❌ 文件发送失败: {text}")
-        except Exception as e:
-            logger.error(f"❌ 文件发送异常: {e}")
-        return False
 
 
 class GitHubManager:
@@ -171,16 +138,20 @@ class GitHubManager:
         try:
             from nacl import encoding, public
             async with aiohttp.ClientSession() as s:
-                async with s.get(f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
-                                 headers=self.headers) as r:
+                async with s.get(
+                    f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
+                    headers=self.headers
+                ) as r:
                     if r.status != 200:
                         return False
                     kd = await r.json()
                 pk = public.PublicKey(kd["key"].encode(), encoding.Base64Encoder())
                 enc = b64encode(public.SealedBox(pk).encrypt(value.encode())).decode()
-                async with s.put(f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
-                                 headers=self.headers,
-                                 json={"encrypted_value": enc, "key_id": kd["key_id"]}) as r:
+                async with s.put(
+                    f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
+                    headers=self.headers,
+                    json={"encrypted_value": enc, "key_id": kd["key_id"]}
+                ) as r:
                     if r.status in [201, 204]:
                         logger.info(f"✅ Secret {name} 已更新")
                         return True
@@ -190,15 +161,15 @@ class GitHubManager:
 
 
 class CastleClient:
+    BASE = "https://cp.castle-host.com"
+
     def __init__(self, ctx: BrowserContext, page: Page):
         self.ctx, self.page = ctx, page
-        self.base = "https://cp.castle-host.com"
 
     async def get_server_ids(self) -> List[str]:
         try:
-            await self.page.goto(f"{self.base}/servers", wait_until="networkidle")
-            content = await self.page.content()
-            match = re.search(r'var\s+ServersID\s*=\s*\[([\d,\s]+)\]', content)
+            await self.page.goto(f"{self.BASE}/servers", wait_until="networkidle")
+            match = re.search(r'var\s+ServersID\s*=\s*\[([\d,\s]+)\]', await self.page.content())
             if match:
                 ids = [x.strip() for x in match.group(1).split(",") if x.strip()]
                 logger.info(f"📋 找到 {len(ids)} 个服务器: {[mask_id(x) for x in ids]}")
@@ -207,87 +178,35 @@ class CastleClient:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
 
-    async def get_console_log(self, sid: str) -> str:
-        """获取服务器控制台日志"""
-        try:
-            await self.page.goto(f"{self.base}/servers/console/index/{sid}", wait_until="networkidle")
-            await self.page.wait_for_timeout(3000)
-
-            console = self.page.locator("#console_data")
-            if await console.count() > 0:
-                log = await console.text_content() or ""
-                logger.info(f"📜 获取到控制台日志 ({len(log)} 字符)")
-                return log
-        except Exception as e:
-            logger.error(f"❌ 获取控制台日志失败: {e}")
-        return ""
-
-    async def start_if_stopped(self, sid: str) -> Tuple[bool, str]:
-        """进入控制页启动服务器，返回(是否启动, 控制台日志)"""
+    async def start_if_stopped(self, sid: str) -> bool:
+        """进入控制页，如果服务器关机则启动"""
         masked = mask_id(sid)
         try:
-            # 进入服务器控制页面
-            await self.page.goto(f"{self.base}/servers/control/index/{sid}", wait_until="networkidle")
+            await self.page.goto(f"{self.BASE}/servers/control/index/{sid}", wait_until="networkidle")
             await self.page.wait_for_timeout(2000)
 
-            # 多种选择器匹配启动按钮
-            selectors = [
-                # 控制页: <a onclick="sendActionStatus(id,'start')">
-                f'a[onclick*="sendActionStatus({sid},\'start\')"]',
+            for sel in [
                 f"a[onclick*=\"sendActionStatus({sid},'start')\"]",
-                # 控制页备用: 按文字匹配 (Запустить = 启动)
                 'a.btn-control:has-text("Запустить")',
-                # 带 play 图标的按钮
                 'a.btn-control:has(i.bi-play)',
-                # 列表页: 可能用 sendAction
-                f'button[onclick*="sendAction({sid},\'start\')"]',
-                f'a[onclick*="sendAction({sid},\'start\')"]',
-            ]
+            ]:
+                btn = self.page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
+                    await btn.click()
+                    await self.page.wait_for_timeout(5000)
+                    logger.info(f"🟢 服务器 {masked} 启动指令已发送")
+                    return True
 
-            for sel in selectors:
-                try:
-                    btn = self.page.locator(sel).first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        logger.info(f"🔴 服务器 {masked} 已关机，正在启动... (选择器: {sel})")
-                        await btn.click()
-                        await self.page.wait_for_timeout(5000)
-
-                        # 检查是否有弹窗确认
-                        confirm_selectors = [
-                            'button:has-text("OK")',
-                            'button:has-text("Да")',
-                            '.swal2-confirm',
-                            'button.btn-success:has-text("OK")',
-                        ]
-                        for csig in confirm_selectors:
-                            try:
-                                confirm = self.page.locator(csig).first
-                                if await confirm.count() > 0 and await confirm.is_visible():
-                                    await confirm.click()
-                                    logger.info(f"✅ 已确认弹窗")
-                                    await self.page.wait_for_timeout(3000)
-                                    break
-                            except:
-                                continue
-
-                        logger.info(f"🟢 服务器 {masked} 启动指令已发送")
-
-                        # 获取控制台日志
-                        log = await self.get_console_log(sid)
-                        return True, log
-                except:
-                    continue
-
-            logger.info(f"✅ 服务器 {masked} 运行中 (无启动按钮)")
+            logger.info(f"✅ 服务器 {masked} 运行中")
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
-        return False, ""
+        return False
 
     async def get_expiry(self, sid: str) -> str:
         try:
-            await self.page.goto(f"{self.base}/servers/pay/index/{sid}", wait_until="networkidle")
-            text = await self.page.text_content("body")
-            match = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+            await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
+            match = re.search(r"(\d{2}\.\d{2}\.\d{4})", await self.page.text_content("body"))
             return match.group(1) if match else ""
         except:
             return ""
@@ -326,8 +245,7 @@ class CastleClient:
                             return RenewalStatus.SUCCESS, "续约成功"
 
                     await self.page.wait_for_timeout(2000)
-                    text = await self.page.text_content("body")
-                    if "24 час" in text:
+                    if "24 час" in await self.page.text_content("body"):
                         return RenewalStatus.RATE_LIMITED, "今日已续期"
                     return RenewalStatus.SUCCESS, "续约成功"
             except:
@@ -336,16 +254,13 @@ class CastleClient:
 
     async def extract_cookies(self) -> Optional[str]:
         try:
-            cookies = await self.ctx.cookies()
-            cc = [c for c in cookies if "castle-host.com" in c.get("domain", "")]
+            cc = [c for c in await self.ctx.cookies() if "castle-host.com" in c.get("domain", "")]
             return "; ".join([f"{c['name']}={c['value']}" for c in cc]) if cc else None
         except:
             return None
 
 
-async def process_account(cookie_str: str, idx: int, config: Config, notifier: Notifier) -> Tuple[
-    Optional[str], List[Tuple[str, int, str]]]:
-    """返回(新Cookie, [(服务器ID, 消息ID, 控制台日志)])"""
+async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tuple[Optional[str], List[ServerResult]]:
     cookies = parse_cookies(cookie_str)
     if not cookies:
         logger.error(f"❌ 账号#{idx + 1} Cookie解析失败")
@@ -353,8 +268,6 @@ async def process_account(cookie_str: str, idx: int, config: Config, notifier: N
 
     logger.info(f"{'=' * 50}")
     logger.info(f"📌 处理账号 #{idx + 1}")
-
-    started_servers: List[Tuple[str, int, str]] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -378,18 +291,13 @@ async def process_account(cookie_str: str, idx: int, config: Config, notifier: N
 
             for sid in server_ids:
                 logger.info(f"--- 处理服务器 {mask_id(sid)} ---")
-
-                # 进入控制页启动服务器并获取日志
-                started, console_log = await client.start_if_stopped(sid)
-
+                started = await client.start_if_stopped(sid)
                 expiry = await client.get_expiry(sid)
                 d = days_left(expiry)
                 logger.info(f"📅 到期: {convert_date(expiry)} ({d}天)")
-
                 status, msg = await client.renew(sid)
                 logger.info(f"📝 结果: {msg}")
-
-                results.append(ServerResult(sid, status, msg, expiry, d, started, console_log))
+                results.append(ServerResult(sid, status, msg, expiry, d, started))
                 await asyncio.sleep(2)
 
             # 发送通知
@@ -402,26 +310,21 @@ async def process_account(cookie_str: str, idx: int, config: Config, notifier: N
                     stat = f"❌ 续约失败: {r.message}"
 
                 started_line = "🟢 服务器已启动\n" if r.started else ""
-                msg = f"""🎁 Castle-Host 自动续约通知
-
-👤 账号: #{idx + 1}
-💻 服务器: {r.server_id}
-📅 到期时间: {convert_date(r.expiry)}
-⏳ 剩余天数: {r.days} 天
-🔗 https://cp.castle-host.com/servers/pay/index/{r.server_id}
-
-{started_line}{stat}"""
-                message_id = await notifier.send(msg)
-
-                # 启动的服务器记录消息ID和日志
-                if r.started and message_id:
-                    started_servers.append((r.server_id, message_id, r.console_log))
+                await notifier.send(
+                    f"🎁 Castle-Host 自动续约通知\n\n"
+                    f"👤 账号: #{idx + 1}\n"
+                    f"💻 服务器: {r.server_id}\n"
+                    f"📅 到期时间: {convert_date(r.expiry)}\n"
+                    f"⏳ 剩余天数: {r.days} 天\n"
+                    f"🔗 https://cp.castle-host.com/servers/pay/index/{r.server_id}\n\n"
+                    f"{started_line}{stat}"
+                )
 
             new_cookie = await client.extract_cookies()
             if new_cookie and new_cookie != cookie_str:
                 logger.info(f"🔄 账号#{idx + 1} Cookie已变化")
-                return new_cookie, started_servers
-            return cookie_str, started_servers
+                return new_cookie, results
+            return cookie_str, results
 
         except Exception as e:
             logger.error(f"❌ 账号#{idx + 1} 异常: {e}")
@@ -449,11 +352,9 @@ async def main():
 
     new_cookies = []
     changed = False
-    all_started: List[Tuple[str, int, str]] = []
 
     for i, cookie in enumerate(config.cookies_list):
-        new, started = await process_account(cookie, i, config, notifier)
-        all_started.extend(started)
+        new, _ = await process_account(cookie, i, notifier)
         if new:
             new_cookies.append(new)
             if new != cookie:
@@ -462,19 +363,6 @@ async def main():
             new_cookies.append(cookie)
         if i < len(config.cookies_list) - 1:
             await asyncio.sleep(5)
-
-    # 发送控制台日志文件
-    for sid, msg_id, console_log in all_started:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        content = f"Castle-Host 服务器启动日志\n"
-        content += f"服务器ID: {sid}\n"
-        content += f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"控制面板: https://cp.castle-host.com/servers/control/index/{sid}\n"
-        content += "=" * 50 + "\n\n"
-        content += "【控制台输出】\n"
-        content += console_log if console_log else "(无日志)"
-
-        await notifier.send_file(content, f"castle_{sid}_{ts}.txt", "📜 启动日志", reply_to=msg_id)
 
     if changed:
         await github.update_secret("CASTLE_COOKIES", ",".join(new_cookies))
