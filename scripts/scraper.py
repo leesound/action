@@ -394,11 +394,20 @@ def main():
     print("📥 获取远程数据...")
     progress = get_remote_json("progress.json", {"last_id": START_ID - 1})
     hash_registry = get_remote_json(f"{IMAGES_DIR}/hash_registry.json", {})
-    folder_counts = get_remote_json(f"{IMAGES_DIR}/count.json", {})
+    raw_folder_counts = get_remote_json(f"{IMAGES_DIR}/count.json", {})
     
+    # 兼容旧格式 {"hd": {"max": 123, "exclude": [...]}}
+    folder_counts = {}
     for f in FOLDERS:
-        if f not in folder_counts:
+        val = raw_folder_counts.get(f, 0)
+        if isinstance(val, dict):
+            folder_counts[f] = val.get("max", 0)
+        elif isinstance(val, int):
+            folder_counts[f] = val
+        else:
             folder_counts[f] = 0
+    
+    print(f"📊 当前计数: {folder_counts}")
     
     current_id = progress.get("last_id", START_ID - 1) + 1
     print(f"📍 从 ID {current_id} 开始\n")
