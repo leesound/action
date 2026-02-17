@@ -1,4 +1,4 @@
-// 如果启动命令固定为 node 就要 index.js 文件调用 bash 来执行你的 start.sh 脚本
+// 如果启动命令固定为 node 就要 index.js 文件调用 bash 来执行你的 start.sh 脚本 
 const { spawn } = require('child_process');
 const path = require('path');
 
