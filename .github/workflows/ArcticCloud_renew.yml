@@ -9,7 +9,7 @@ name: ArcticCloud 自动续期
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '02 4 * * *'  # 每天北京时间 12:02 运行
   workflow_dispatch:
 
 jobs:
