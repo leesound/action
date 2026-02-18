@@ -27,14 +27,7 @@ jobs:
           const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
           const BASE_URL = 'https://vps.polarbear.nyc.mn';
-
-          // 跳过 SSL 证书验证
           const agent = new https.Agent({ rejectUnauthorized: false });
-
-          function maskUsername(username) {
-            if (username.length <= 2) return '***';
-            return username[0] + '*'.repeat(username.length - 2) + username[username.length - 1];
-          }
 
           function request(url, options = {}) {
             return new Promise((resolve, reject) => {
@@ -43,9 +36,8 @@ jobs:
                 method: options.method || 'GET',
                 agent: u.hostname === 'vps.polarbear.nyc.mn' ? agent : undefined,
                 headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                  'Accept-Language': 'zh-CN,zh;q=0.9',
                   ...options.headers
                 }
               }, (res) => {
@@ -57,7 +49,6 @@ jobs:
                   body: data
                 }));
               });
-              
               req.on('error', reject);
               if (options.body) req.write(options.body);
               req.end();
@@ -70,49 +61,32 @@ jobs:
               await request(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: TG_CHAT_ID,
-                  text: message,
-                  parse_mode: 'Markdown'
-                })
+                body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message, parse_mode: 'Markdown' })
               });
-            } catch (e) {
-              console.log('Telegram 发送失败:', e.message);
-            }
+            } catch (e) {}
           }
 
           function parseAccounts(str) {
             const accounts = [];
-            const lines = str.trim().split('\n');
-            
-            for (const line of lines) {
+            for (const line of str.trim().split('\n')) {
               if (!line.trim()) continue;
               const parts = line.split(':');
               if (parts.length < 4) continue;
-              
               const username = parts[0].trim();
               const password = parts[1].trim();
-              const vpsListStr = parts.slice(2).join(':');
-              
               const vpsList = [];
-              const vpsItems = vpsListStr.split(',');
-              for (const item of vpsItems) {
+              for (const item of parts.slice(2).join(':').split(',')) {
                 const [id, name] = item.split(':');
-                if (id && name) {
-                  vpsList.push({ id: id.trim(), name: name.trim() });
-                }
+                if (id && name) vpsList.push({ id: id.trim(), name: name.trim() });
               }
-              
-              if (vpsList.length > 0) {
-                accounts.push({ username, password, vpsList });
-              }
+              if (vpsList.length > 0) accounts.push({ username, password, vpsList });
             }
             return accounts;
           }
 
-          async function renewAccount(account, forLog = false) {
-            const displayName = forLog ? maskUsername(account.username) : account.username;
-            let log = `\n👤 *账号: ${displayName}*\n`;
+          async function renewAccount(account, index) {
+            let logResult = `\n🔹 *账号 ${index}*\n`;
+            let tgResult = `\n👤 *${account.username}*\n`;
 
             try {
               const loginResp = await request(`${BASE_URL}/index/login/`, {
@@ -131,25 +105,27 @@ jobs:
 
               if (location.includes('error=')) {
                 const error = decodeURIComponent(location.match(/error=([^&]+)/)?.[1] || '未知');
-                log += `❌ 登录失败: ${error}\n`;
-                return log;
+                logResult += `❌ 登录失败: ${error}\n`;
+                tgResult += `❌ 登录失败: ${error}\n`;
+                return { logResult, tgResult };
               }
 
               const uuidMatch = /swapuuid=([^;]+)/.exec(cookieStr);
               if (!uuidMatch) {
-                log += `❌ 登录失败: 未获取凭证\n`;
-                return log;
+                logResult += `❌ 登录失败: 未获取凭证\n`;
+                tgResult += `❌ 登录失败: 未获取凭证\n`;
+                return { logResult, tgResult };
               }
 
-              const swapuuid = uuidMatch[1];
-              log += `✅ 登录成功\n`;
+              logResult += `✅ 登录成功\n`;
+              tgResult += `✅ 登录成功\n`;
 
               for (const vps of account.vpsList) {
                 const renewResp = await request(`${BASE_URL}/control/detail/${vps.id}/pay/`, {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
-                    'Cookie': `swapuuid=${swapuuid}`,
+                    'Cookie': `swapuuid=${uuidMatch[1]}`,
                     'Origin': BASE_URL,
                     'Referer': `${BASE_URL}/control/detail/${vps.id}/`
                   }
@@ -159,53 +135,55 @@ jobs:
                 const successMatch = renewLocation.match(/success=([^&]+)/);
                 const errorMatch = renewLocation.match(/error=([^&]+)/);
 
+                let result;
                 if (successMatch) {
-                  log += `  ✅ ${vps.name}: ${decodeURIComponent(successMatch[1])}\n`;
+                  result = `✅ ${vps.name}: ${decodeURIComponent(successMatch[1])}`;
                 } else if (errorMatch) {
-                  log += `  ❌ ${vps.name}: ${decodeURIComponent(errorMatch[1])}\n`;
+                  result = `❌ ${vps.name}: ${decodeURIComponent(errorMatch[1])}`;
                 } else {
-                  log += `  ❓ ${vps.name}: 状态码 ${renewResp.status}\n`;
+                  result = `❓ ${vps.name}: 状态码 ${renewResp.status}`;
                 }
+                logResult += `  ${result}\n`;
+                tgResult += `  ${result}\n`;
               }
 
             } catch (err) {
-              log += `❌ 异常: ${err.message}\n`;
+              logResult += `❌ 异常: ${err.message}\n`;
+              tgResult += `❌ 异常: ${err.message}\n`;
             }
 
-            return log;
+            return { logResult, tgResult };
           }
 
           async function main() {
             const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
             
             if (!ACCOUNTS) {
-              const msg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 未设置`;
-              console.log(msg.replace(/\*/g, ''));
-              await sendTelegram(msg);
+              console.log('❌ ACCOUNTS 未设置');
+              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 未设置`);
               return;
             }
 
             const accounts = parseAccounts(ACCOUNTS);
-            
             if (accounts.length === 0) {
-              const msg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 格式错误`;
-              console.log(msg.replace(/\*/g, ''));
-              await sendTelegram(msg);
+              console.log('❌ ACCOUNTS 格式错误');
+              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 格式错误`);
               return;
             }
 
-            let logMsg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n📊 共 ${accounts.length} 个账号\n`;
-            let tgMsg = logMsg;
+            let logMsg = `🐻 ArcticCloud VPS 续期\n🕒 ${timeStr}\n📊 共 ${accounts.length} 个账号\n`;
+            let tgMsg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n📊 共 ${accounts.length} 个账号\n`;
 
-            for (const account of accounts) {
-              logMsg += await renewAccount(account, true);   // 日志隐藏账号
-              tgMsg += await renewAccount(account, false);   // 通知显示账号
+            for (let i = 0; i < accounts.length; i++) {
+              const { logResult, tgResult } = await renewAccount(accounts[i], i + 1);
+              logMsg += logResult.replace(/\*/g, '');
+              tgMsg += tgResult;
             }
 
             logMsg += '\n✅ 任务完成';
             tgMsg += '\n✅ 任务完成';
 
-            console.log(logMsg.replace(/\*/g, ''));
+            console.log(logMsg);
             await sendTelegram(tgMsg);
           }
 
