@@ -7,7 +7,7 @@
 
 name: ArcticCloud 自动续期
 
-于:
+on:
   schedule:
     # 每天 UTC 时间 3:00 运行 (北京时间 11:00)
     - cron: '0 3 * * *'
