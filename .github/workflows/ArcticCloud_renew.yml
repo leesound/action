@@ -22,9 +22,9 @@ jobs:
           const https = require('https');
           const { URL } = require('url');
 
-          const ACCOUNTS = process.env.ACCOUNTS;
-          const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-          const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+          const ACCOUNTS = process.env.ARCTICCLOUD_ACCOUNTS;
+          const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
+          const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
           const BASE_URL = 'https://vps.polarbear.nyc.mn';
           const agent = new https.Agent({ rejectUnauthorized: false });
@@ -85,7 +85,7 @@ jobs:
           }
 
           async function renewAccount(account, index) {
-            let logResult = `\n🔹 *账号 ${index}*\n`;
+            let logResult = `\n🔹 账号 ${index}\n`;
             let tgResult = `\n👤 *${account.username}*\n`;
 
             try {
@@ -159,15 +159,15 @@ jobs:
             const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
             
             if (!ACCOUNTS) {
-              console.log('❌ ACCOUNTS 未设置');
-              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 未设置`);
+              console.log('❌ ARCTICCLOUD_ACCOUNTS 未设置');
+              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ARCTICCLOUD_ACCOUNTS 未设置`);
               return;
             }
 
             const accounts = parseAccounts(ACCOUNTS);
             if (accounts.length === 0) {
-              console.log('❌ ACCOUNTS 格式错误');
-              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 格式错误`);
+              console.log('❌ ARCTICCLOUD_ACCOUNTS 格式错误');
+              await sendTelegram(`🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ARCTICCLOUD_ACCOUNTS 格式错误`);
               return;
             }
 
@@ -176,7 +176,7 @@ jobs:
 
             for (let i = 0; i < accounts.length; i++) {
               const { logResult, tgResult } = await renewAccount(accounts[i], i + 1);
-              logMsg += logResult.replace(/\*/g, '');
+              logMsg += logResult;
               tgMsg += tgResult;
             }
 
@@ -191,6 +191,6 @@ jobs:
           EOF
           node renew.js
         env:
-          ACCOUNTS: ${{ secrets.ARCTICCLOUD_ACCOUNTS }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ARCTICCLOUD_ACCOUNTS: ${{ secrets.ARCTICCLOUD_ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
