@@ -9,9 +9,8 @@ name: ArcticCloud 自动续期
 
 on:
   schedule:
-    # 每天 UTC 时间 3:00 运行 (北京时间 11:00)
     - cron: '0 3 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   renew:
@@ -29,11 +28,20 @@ jobs:
 
           const BASE_URL = 'https://vps.polarbear.nyc.mn';
 
+          // 跳过 SSL 证书验证
+          const agent = new https.Agent({ rejectUnauthorized: false });
+
+          function maskUsername(username) {
+            if (username.length <= 2) return '***';
+            return username[0] + '*'.repeat(username.length - 2) + username[username.length - 1];
+          }
+
           function request(url, options = {}) {
             return new Promise((resolve, reject) => {
               const u = new URL(url);
               const req = https.request(url, {
                 method: options.method || 'GET',
+                agent: u.hostname === 'vps.polarbear.nyc.mn' ? agent : undefined,
                 headers: {
                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -74,8 +82,6 @@ jobs:
           }
 
           function parseAccounts(str) {
-            // 格式: 用户名:密码:VPS_ID:VPS名称,VPS_ID:VPS名称
-            // 多账号用换行分隔
             const accounts = [];
             const lines = str.trim().split('\n');
             
@@ -88,7 +94,6 @@ jobs:
               const password = parts[1].trim();
               const vpsListStr = parts.slice(2).join(':');
               
-              // 解析 VPS 列表: ID:名称,ID:名称
               const vpsList = [];
               const vpsItems = vpsListStr.split(',');
               for (const item of vpsItems) {
@@ -105,11 +110,11 @@ jobs:
             return accounts;
           }
 
-          async function renewAccount(account) {
-            let log = `\n👤 *账号: ${account.username}*\n`;
+          async function renewAccount(account, forLog = false) {
+            const displayName = forLog ? maskUsername(account.username) : account.username;
+            let log = `\n👤 *账号: ${displayName}*\n`;
 
             try {
-              // 登录
               const loginResp = await request(`${BASE_URL}/index/login/`, {
                 method: 'POST',
                 headers: {
@@ -139,7 +144,6 @@ jobs:
               const swapuuid = uuidMatch[1];
               log += `✅ 登录成功\n`;
 
-              // 续期每个 VPS
               for (const vps of account.vpsList) {
                 const renewResp = await request(`${BASE_URL}/control/detail/${vps.id}/pay/`, {
                   method: 'POST',
@@ -172,34 +176,37 @@ jobs:
           }
 
           async function main() {
-            let log = `🐻 *ArcticCloud VPS 续期*\n`;
-            log += `🕒 ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}\n`;
-
+            const timeStr = new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+            
             if (!ACCOUNTS) {
-              log += '\n❌ ACCOUNTS 未设置';
-              console.log(log);
-              await sendTelegram(log);
+              const msg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 未设置`;
+              console.log(msg.replace(/\*/g, ''));
+              await sendTelegram(msg);
               return;
             }
 
             const accounts = parseAccounts(ACCOUNTS);
             
             if (accounts.length === 0) {
-              log += '\n❌ ACCOUNTS 格式错误';
-              console.log(log);
-              await sendTelegram(log);
+              const msg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n❌ ACCOUNTS 格式错误`;
+              console.log(msg.replace(/\*/g, ''));
+              await sendTelegram(msg);
               return;
             }
 
-            log += `\n📊 共 ${accounts.length} 个账号\n`;
+            let logMsg = `🐻 *ArcticCloud VPS 续期*\n🕒 ${timeStr}\n\n📊 共 ${accounts.length} 个账号\n`;
+            let tgMsg = logMsg;
 
             for (const account of accounts) {
-              log += await renewAccount(account);
+              logMsg += await renewAccount(account, true);   // 日志隐藏账号
+              tgMsg += await renewAccount(account, false);   // 通知显示账号
             }
 
-            log += '\n✅ 任务完成';
-            console.log(log);
-            await sendTelegram(log);
+            logMsg += '\n✅ 任务完成';
+            tgMsg += '\n✅ 任务完成';
+
+            console.log(logMsg.replace(/\*/g, ''));
+            await sendTelegram(tgMsg);
           }
 
           main();
