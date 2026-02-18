@@ -1,0 +1,211 @@
+# ACCOUNTS 格式详解
+# 单账号多VPS：user:password:179:洛杉矶VPS,180:东京VPS,181:香港VPS
+# 多账号（换行分隔）：
+# user1:password1:179:洛杉矶VPS,180:东京VPS
+# user2:password2:185:测试机
+# user3:password3:190:备用机,191:开发机
+
+name: ArcticCloud 自动续期
+
+于:
+  schedule:
+    # 每天 UTC 时间 3:00 运行 (北京时间 11:00)
+    - cron: '0 3 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 续期 VPS
+        run: |
+          cat << 'EOF' > renew.js
+          const https = require('https');
+          const { URL } = require('url');
+
+          const ACCOUNTS = process.env.ACCOUNTS;
+          const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+          const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+          const BASE_URL = 'https://vps.polarbear.nyc.mn';
+
+          function request(url, options = {}) {
+            return new Promise((resolve, reject) => {
+              const u = new URL(url);
+              const req = https.request(url, {
+                method: options.method || 'GET',
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'zh-CN,zh;q=0.9',
+                  ...options.headers
+                }
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve({
+                  status: res.statusCode,
+                  headers: res.headers,
+                  body: data
+                }));
+              });
+              
+              req.on('error', reject);
+              if (options.body) req.write(options.body);
+              req.end();
+            });
+          }
+
+          async function sendTelegram(message) {
+            if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+            try {
+              await request(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: TG_CHAT_ID,
+                  text: message,
+                  parse_mode: 'Markdown'
+                })
+              });
+            } catch (e) {
+              console.log('Telegram 发送失败:', e.message);
+            }
+          }
+
+          function parseAccounts(str) {
+            // 格式: 用户名:密码:VPS_ID:VPS名称,VPS_ID:VPS名称
+            // 多账号用换行分隔
+            const accounts = [];
+            const lines = str.trim().split('\n');
+            
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              const parts = line.split(':');
+              if (parts.length < 4) continue;
+              
+              const username = parts[0].trim();
+              const password = parts[1].trim();
+              const vpsListStr = parts.slice(2).join(':');
+              
+              // 解析 VPS 列表: ID:名称,ID:名称
+              const vpsList = [];
+              const vpsItems = vpsListStr.split(',');
+              for (const item of vpsItems) {
+                const [id, name] = item.split(':');
+                if (id && name) {
+                  vpsList.push({ id: id.trim(), name: name.trim() });
+                }
+              }
+              
+              if (vpsList.length > 0) {
+                accounts.push({ username, password, vpsList });
+              }
+            }
+            return accounts;
+          }
+
+          async function renewAccount(account) {
+            let log = `\n👤 *账号: ${account.username}*\n`;
+
+            try {
+              // 登录
+              const loginResp = await request(`${BASE_URL}/index/login/`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Origin': BASE_URL,
+                  'Referer': `${BASE_URL}/index/login/`
+                },
+                body: `swapname=${encodeURIComponent(account.username)}&swappass=${encodeURIComponent(account.password)}`
+              });
+
+              const location = loginResp.headers.location || '';
+              const setCookie = loginResp.headers['set-cookie'] || [];
+              const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
+
+              if (location.includes('error=')) {
+                const error = decodeURIComponent(location.match(/error=([^&]+)/)?.[1] || '未知');
+                log += `❌ 登录失败: ${error}\n`;
+                return log;
+              }
+
+              const uuidMatch = /swapuuid=([^;]+)/.exec(cookieStr);
+              if (!uuidMatch) {
+                log += `❌ 登录失败: 未获取凭证\n`;
+                return log;
+              }
+
+              const swapuuid = uuidMatch[1];
+              log += `✅ 登录成功\n`;
+
+              // 续期每个 VPS
+              for (const vps of account.vpsList) {
+                const renewResp = await request(`${BASE_URL}/control/detail/${vps.id}/pay/`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Cookie': `swapuuid=${swapuuid}`,
+                    'Origin': BASE_URL,
+                    'Referer': `${BASE_URL}/control/detail/${vps.id}/`
+                  }
+                });
+
+                const renewLocation = renewResp.headers.location || '';
+                const successMatch = renewLocation.match(/success=([^&]+)/);
+                const errorMatch = renewLocation.match(/error=([^&]+)/);
+
+                if (successMatch) {
+                  log += `  ✅ ${vps.name}: ${decodeURIComponent(successMatch[1])}\n`;
+                } else if (errorMatch) {
+                  log += `  ❌ ${vps.name}: ${decodeURIComponent(errorMatch[1])}\n`;
+                } else {
+                  log += `  ❓ ${vps.name}: 状态码 ${renewResp.status}\n`;
+                }
+              }
+
+            } catch (err) {
+              log += `❌ 异常: ${err.message}\n`;
+            }
+
+            return log;
+          }
+
+          async function main() {
+            let log = `🐻 *ArcticCloud VPS 续期*\n`;
+            log += `🕒 ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}\n`;
+
+            if (!ACCOUNTS) {
+              log += '\n❌ ACCOUNTS 未设置';
+              console.log(log);
+              await sendTelegram(log);
+              return;
+            }
+
+            const accounts = parseAccounts(ACCOUNTS);
+            
+            if (accounts.length === 0) {
+              log += '\n❌ ACCOUNTS 格式错误';
+              console.log(log);
+              await sendTelegram(log);
+              return;
+            }
+
+            log += `\n📊 共 ${accounts.length} 个账号\n`;
+
+            for (const account of accounts) {
+              log += await renewAccount(account);
+            }
+
+            log += '\n✅ 任务完成';
+            console.log(log);
+            await sendTelegram(log);
+          }
+
+          main();
+          EOF
+          node renew.js
+        env:
+          ACCOUNTS: ${{ secrets.ARCTICCLOUD_ACCOUNTS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
