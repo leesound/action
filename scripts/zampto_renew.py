@@ -15,34 +15,26 @@ SERVER_URL = "https://dash.zampto.net/server?id={}"
 OUTPUT_DIR = Path("output/screenshots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 中国时区
 CN_TZ = timezone(timedelta(hours=8))
 
 def cn_now() -> datetime:
-    """获取中国时区当前时间"""
     return datetime.now(CN_TZ)
 
 def cn_time_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
-    """获取中国时区时间字符串"""
     return cn_now().strftime(fmt)
 
 def parse_renewal_time(time_str: str) -> str:
-    """将网站时间(UTC)转换为中国时区格式"""
     if not time_str:
         return "未知"
     try:
-        # 解析 "Feb 19, 2026 5:36 PM" 格式
         dt = datetime.strptime(time_str, "%b %d, %Y %I:%M %p")
-        # 设为 UTC 时区
         dt = dt.replace(tzinfo=timezone.utc)
-        # 转换为中国时区
         dt_cn = dt.astimezone(CN_TZ)
         return dt_cn.strftime("%Y年%m月%d日 %H时%M分")
     except:
         return time_str
 
 def calc_expiry_time(renewal_time_str: str, minutes: int = 2880) -> str:
-    """根据续期时间计算到期时间"""
     if not renewal_time_str:
         return "未知"
     try:
@@ -55,7 +47,6 @@ def calc_expiry_time(renewal_time_str: str, minutes: int = 2880) -> str:
         return "未知"
 
 def mask(s: str, show: int = 1) -> str:
-    """隐藏敏感信息"""
     if not s: return "***"
     s = str(s)
     if len(s) <= show: return s[0] + "***"
@@ -116,34 +107,132 @@ def wait_turnstile(sb, wait: int = 60) -> bool:
 def login(sb, user: str, pwd: str, idx: int) -> bool:
     user_masked = mask(user)
     print(f"\n{'='*50}\n[INFO] 账号 {idx}: 登录 {user_masked}\n{'='*50}")
-    sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=8.0)
-    time.sleep(3)
-    sb.save_screenshot(shot(idx, "01-login"))
     
-    if "dash.zampto.net" in sb.get_current_url():
-        print("[INFO] ✅ 已登录")
-        return True
+    # 最多重试3次打开登录页
+    for attempt in range(3):
+        try:
+            print(f"[INFO] 打开登录页 (尝试 {attempt + 1}/3)...")
+            sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=10.0)
+            time.sleep(5)
+            
+            # 检查是否已登录
+            current_url = sb.get_current_url()
+            if "dash.zampto.net" in current_url:
+                print("[INFO] ✅ 已登录")
+                return True
+            
+            sb.save_screenshot(shot(idx, f"01-login-{attempt}"))
+            
+            # 等待页面加载完成
+            for _ in range(10):
+                src = sb.get_page_source()
+                if 'identifier' in src or 'email' in src or 'username' in src:
+                    break
+                time.sleep(2)
+            
+            # 尝试多种选择器查找输入框
+            selectors = [
+                'input[name="identifier"]',
+                'input[type="email"]',
+                'input[type="text"]',
+                '#identifier',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="user" i]'
+            ]
+            
+            input_found = False
+            for sel in selectors:
+                try:
+                    sb.wait_for_element(sel, timeout=5)
+                    print(f"[INFO] 找到输入框: {sel}")
+                    input_found = True
+                    
+                    # 输入用户名
+                    sb.type(sel, user)
+                    time.sleep(1)
+                    break
+                except:
+                    continue
+            
+            if not input_found:
+                print(f"[WARN] 尝试 {attempt + 1}: 未找到输入框")
+                sb.save_screenshot(shot(idx, f"01-noinput-{attempt}"))
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                else:
+                    print("[ERROR] 未找到登录表单")
+                    return False
+            
+            # 点击继续按钮
+            try:
+                sb.click('button[type="submit"]')
+            except:
+                try:
+                    sb.click('button')
+                except:
+                    pass
+            
+            time.sleep(4)
+            
+            # 等待密码输入框
+            pwd_selectors = [
+                'input[name="password"]',
+                'input[type="password"]',
+                '#password'
+            ]
+            
+            pwd_found = False
+            for _ in range(15):
+                for sel in pwd_selectors:
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.type(sel, pwd)
+                            pwd_found = True
+                            print("[INFO] 已输入密码")
+                            break
+                    except:
+                        continue
+                if pwd_found:
+                    break
+                time.sleep(1)
+            
+            if not pwd_found:
+                print("[WARN] 密码页面未加载")
+                sb.save_screenshot(shot(idx, f"02-nopwd-{attempt}"))
+                if attempt < 2:
+                    continue
+                return False
+            
+            time.sleep(1)
+            
+            # 点击登录按钮
+            try:
+                sb.click('button[type="submit"]')
+            except:
+                try:
+                    sb.click('button')
+                except:
+                    pass
+            
+            time.sleep(6)
+            sb.save_screenshot(shot(idx, "02-result"))
+            
+            # 检查登录结果
+            current_url = sb.get_current_url()
+            if "dash.zampto.net" in current_url or "sign-in" not in current_url:
+                print("[INFO] ✅ 登录成功")
+                return True
+            
+            print(f"[WARN] 尝试 {attempt + 1}: 登录未成功，URL: {current_url}")
+            
+        except Exception as e:
+            print(f"[WARN] 尝试 {attempt + 1} 异常: {e}")
+            sb.save_screenshot(shot(idx, f"01-error-{attempt}"))
+            if attempt < 2:
+                time.sleep(5)
+                continue
     
-    try: sb.wait_for_element('input[name="identifier"]', timeout=20)
-    except: print("[ERROR] 未找到登录表单"); return False
-    
-    sb.type('input[name="identifier"]', user)
-    time.sleep(1)
-    sb.click('button[type="submit"]')
-    time.sleep(3)
-    
-    try: sb.wait_for_element('input[name="password"]', timeout=15)
-    except: print("[ERROR] 密码页面未加载"); return False
-    
-    sb.type('input[name="password"]', pwd)
-    time.sleep(1)
-    sb.click('button[type="submit"]')
-    time.sleep(5)
-    sb.save_screenshot(shot(idx, "02-result"))
-    
-    if "dash.zampto.net" in sb.get_current_url() or "sign-in" not in sb.get_current_url():
-        print("[INFO] ✅ 登录成功")
-        return True
     print("[ERROR] 登录失败")
     return False
 
@@ -225,7 +314,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         result["message"] = "访问被阻止"
         return result
     
-    # 获取续期前时间
     old_renewal = ""
     try:
         old_renewal = sb.execute_script('''
@@ -240,7 +328,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     result["old_time_cn"] = parse_renewal_time(old_renewal)
     print(f"[INFO] 续期前时间: {old_renewal}")
     
-    # 点击续期按钮
     try:
         clicked = sb.execute_script(f'''
             (function() {{
@@ -286,7 +373,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     sb.save_screenshot(sp)
     result["screenshot"] = sp
     
-    # 刷新页面获取新时间
     sb.open(SERVER_URL.format(sid))
     time.sleep(3)
     
@@ -313,7 +399,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     
     print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
     
-    # 判断是否成功
     today = datetime.now().strftime('%b %d, %Y')
     if new_renewal and new_renewal != old_renewal:
         result["success"] = True
@@ -429,7 +514,6 @@ def main():
     total_srv = sum(len(r.get("servers", [])) for r in results)
     ok_srv = sum(sum(1 for s in r.get("servers", []) if s.get("success")) for r in results)
     
-    # 日志输出（隐藏敏感信息）
     log_summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
     for r in results:
         log_summary += f"{'✅' if r.get('success') else '❌'} {mask(r['username'])}: {r.get('message','')}\n"
@@ -438,7 +522,6 @@ def main():
     
     print(f"\n{'='*50}\n{log_summary}{'='*50}")
     
-    # 通知（完整信息，中国时区）
     notify_summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
     for r in results:
         notify_summary += f"{'✅' if r.get('success') else '❌'} {r['username']}: {r.get('message','')}\n"
