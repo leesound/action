@@ -1,6 +1,5 @@
 # nodeloc/main.py
 import os
-import json
 import logging
 import requests
 from browser import create_browser
@@ -39,6 +38,21 @@ def send_telegram(message):
         requests.post(url, data=data, timeout=10)
     except Exception as e:
         logging.error(f'TG通知失败: {e}')
+
+def parse_accounts(account_str):
+    """解析账号配置，格式：username:password，每行一个"""
+    accounts = []
+    for line in account_str.strip().split('\n'):
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        parts = line.split(':', 1)
+        if len(parts) == 2:
+            accounts.append({
+                'username': parts[0].strip(),
+                'password': parts[1].strip()
+            })
+    return accounts
 
 def process_account(username, password):
     """处理单个账号签到"""
@@ -91,27 +105,24 @@ def process_account(username, password):
             driver.quit()
 
 def main():
-    account_json = os.environ.get('NL_ACCOUNT', '')
+    account_str = os.environ.get('NL_ACCOUNT', '')
     
-    if not account_json:
+    if not account_str:
         logging.error('❌ 未配置 NL_ACCOUNT')
         return
     
-    try:
-        accounts = json.loads(account_json)
-    except json.JSONDecodeError:
-        logging.error('❌ NL_ACCOUNT 格式错误')
-        return
+    accounts = parse_accounts(account_str)
     
     if not accounts:
-        logging.error('❌ 账号列表为空')
+        logging.error('❌ 账号列表为空，格式：username:password，每行一个')
         return
     
     logging.info(f'✅ 共 {len(accounts)} 个账号，开始签到')
     
     results = []
     for i, acc in enumerate(accounts, 1):
-        logging.info(f'--- 账号 {i}/{len(accounts)} ---')
+        masked = mask_username(acc['username'])
+        logging.info(f'--- 账号 {i}/{len(accounts)}: {masked} ---')
         status, msg = process_account(acc['username'], acc['password'])
         
         if status == 'success':
@@ -121,7 +132,7 @@ def main():
         else:
             results.append(f'❌ {msg}')
         
-        logging.info(f'[{results[-1][:1]}] {msg}')
+        logging.info(results[-1])
     
     logging.info('✅ 全部完成')
     
