@@ -27,7 +27,7 @@ jobs:
       - name: 安装Chrome浏览器
         uses: browser-actions/setup-chrome@v1
         with:
-          chrome-version: stable
+          chrome-version: 131
 
       - name: 安装Python依赖
         run: pip install undetected-chromedriver selenium
