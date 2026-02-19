@@ -1,4 +1,3 @@
-# .github/workflows/checkin.yml
 name: NodeLoc 每日签到
 
 on:
@@ -32,19 +31,24 @@ jobs:
           chrome-version: 131
 
       - name: 安装Python依赖
-        run: pip install undetected-chromedriver selenium
+        run: pip install undetected-chromedriver selenium requests
+
+      - name: 创建截图目录
+        run: mkdir -p /tmp/screenshots
 
       - name: 执行签到脚本
         env:
           NL_ACCOUNT: ${{ secrets.NL_ACCOUNT }}
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python nodeloc/main.py
 
       - name: 上传调试截图
-        if: failure() || github.event.inputs.debug == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: /tmp/*.png
+          path: /tmp/screenshots/
           retention-days: 3
           if-no-files-found: ignore
