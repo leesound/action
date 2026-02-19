@@ -1,4 +1,3 @@
-# nodeloc/checkin.py
 # -*- coding: utf-8 -*-
 """
 NodeLoc 签到核心逻辑
@@ -20,7 +19,7 @@ LOGIN_URL = f"{BASE_URL}/login"
 
 def do_login(driver, username: str, password: str) -> bool:
     """使用账号密码登录"""
-    log.info(f"🔐 开始登录: {username}")
+    log.info(f"🔐 开始登录...")
     driver.get(LOGIN_URL)
     time.sleep(3)
 
@@ -124,9 +123,14 @@ def get_username_from_page(driver) -> str:
     return "unknown"
 
 
-def do_checkin(driver, username: str) -> str:
-    """执行签到：点击签到图标"""
-    log.info(f"📌 {username} 执行签到")
+def do_checkin(driver, display_name: str) -> str:
+    """执行签到：点击签到图标
+    
+    Args:
+        driver: 浏览器驱动
+        display_name: 用于显示的名称（已脱敏）
+    """
+    log.info(f"📌 执行签到...")
 
     try:
         # 查找签到按钮（日历图标）
@@ -162,7 +166,7 @@ def do_checkin(driver, username: str) -> str:
 
         if not checkin_btn:
             log.warning("⚠️ 未找到签到按钮")
-            return f"[❌] {username} 未找到签到按钮"
+            return f"[❌] {display_name} 未找到签到按钮"
 
         # 点击签到
         checkin_btn.click()
@@ -170,15 +174,15 @@ def do_checkin(driver, username: str) -> str:
         time.sleep(3)
 
         # 等待并获取签到结果
-        result = _get_checkin_result(driver, username)
+        result = _get_checkin_result(driver, display_name)
         return result
 
     except Exception as e:
         log.error(f"❌ 签到异常: {e}")
-        return f"[❌] {username} 签到异常: {e}"
+        return f"[❌] {display_name} 签到异常: {e}"
 
 
-def _get_checkin_result(driver, username: str) -> str:
+def _get_checkin_result(driver, display_name: str) -> str:
     """获取签到结果"""
     # 尝试多种弹窗选择器
     alert_selectors = [
@@ -201,19 +205,19 @@ def _get_checkin_result(driver, username: str) -> str:
                 log.info(f"🔔 弹窗内容: {text}")
                 
                 if "签到成功" in text:
-                    return f"[🎉] {username} {text}"
+                    return f"[🎉] {display_name} {text}"
                 elif "已经签到" in text or "已签到" in text:
-                    return f"[⏭️] {username} 今日已签到"
+                    return f"[⏭️] {display_name} 今日已签到"
                 else:
-                    return f"[⚠️] {username} {text}"
+                    return f"[⚠️] {display_name} {text}"
         except TimeoutException:
             continue
 
     # 检查页面源码
     page = driver.page_source
     if "签到成功" in page:
-        return f"[🎉] {username} 签到成功"
+        return f"[🎉] {display_name} 签到成功"
     elif "已连续签到" in page or "已签到" in page:
-        return f"[⏭️] {username} 今日已签到"
+        return f"[⏭️] {display_name} 今日已签到"
 
-    return f"[❓] {username} 签到状态未知"
+    return f"[❓] {display_name} 签到状态未知"
