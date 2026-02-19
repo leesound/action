@@ -1,47 +1,72 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import os
+import time
 import logging
-import sys
-from config import load_accounts, BASE_URL
-from browser import create_driver, inject_cookies
-from checkin import do_checkin
+from browser import create_browser, inject_cookies
+from checkin import (
+    BASE_URL,
+    USER_PAGE,
+    COOKIE_DOMAIN,
+    wait_login_success,
+    get_username,
+    do_checkin,
+)
 
+# ================== 日志配置 ==================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger(__name__)
+# =============================================
+
+
+def process_account(cookie: str) -> str:
+    driver = create_browser()
+    if not driver:
+        return "[❌] 浏览器启动失败"
+
+    try:
+        inject_cookies(driver, BASE_URL, cookie, COOKIE_DOMAIN)
+        driver.get(USER_PAGE)
+
+        if not wait_login_success(driver):
+            return "[❌] 登录失败，Cookie 可能失效"
+
+        username = get_username(driver)
+        log.info(f"👤 当前账号: {username}")
+
+        return do_checkin(driver, username)
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 def main():
-    accounts = load_accounts()
-    if not accounts:
-        log.error("❌ 未配置任何账号")
-        sys.exit(1)
+    if "NL_COOKIE" not in os.environ:
+        print("❌ 未设置 NL_COOKIE 环境变量")
+        return
 
-    log.info(f"✅ 共 {len(accounts)} 个账号，开始签到")
+    cookies = [
+        line.strip().split("#", 1)[0]
+        for line in os.environ["NL_COOKIE"].splitlines()
+        if line.strip()
+    ]
+
+    log.info(f"✅ 共 {len(cookies)} 个账号，开始签到")
+
     results = []
+    for cookie in cookies:
+        result = process_account(cookie)
+        log.info(result)
+        results.append(result)
+        time.sleep(5)
 
-    for acc in accounts:
-        driver = None
-        try:
-            driver = create_driver()
-            inject_cookies(driver, acc["cookies"], BASE_URL)
-            username = acc["username"]
-            log.info(f"👤 当前账号: {username}")
-            result = do_checkin(driver, BASE_URL, username)
-            results.append(result)
-            print(result)
-        except Exception as e:
-            msg = f"[err] {acc.get('username', '未知')} 异常: {e}"
-            log.error(msg)
-            results.append(msg)
-        finally:
-            if driver:
-                driver.quit()
-
+    print("\n".join(results))
     log.info("✅ 全部完成")
 
 
