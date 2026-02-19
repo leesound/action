@@ -1,3 +1,4 @@
+# .github/workflows/checkin.yml
 name: NodeLoc 每日签到
 
 on:
@@ -25,6 +26,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安装Chrome浏览器
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: 131
@@ -35,6 +37,7 @@ jobs:
       - name: 执行签到脚本
         env:
           NL_ACCOUNT: ${{ secrets.NL_ACCOUNT }}
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: python nodeloc/main.py
 
       - name: 上传调试截图
