@@ -1,32 +1,52 @@
-# .github/workflows/nodeloc_renew.yml
+# .github/workflows/checkin.yml
 name: NodeLoc 每日签到
 
 on:
   schedule:
     - cron: '0 22 * * *'
   workflow_dispatch:
+    inputs:
+      debug:
+        description: '调试模式'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   checkin:
+    name: 执行签到
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: 拉取代码
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: 配置Python环境
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - id: setup-chrome
+      - name: 安装Chrome浏览器
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: 131
 
-      - run: pip install undetected-chromedriver selenium requests
+      - name: 安装Python依赖
+        run: pip install undetected-chromedriver selenium requests
 
-      - name: 执行签到
+      - name: 执行签到脚本
         env:
           NL_ACCOUNT: ${{ secrets.NL_ACCOUNT }}
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python nodeloc/main.py
+
+      - name: 上传调试截图
+        if: failure() || github.event.inputs.debug == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: /tmp/*.png
+          retention-days: 3
+          if-no-files-found: ignore
