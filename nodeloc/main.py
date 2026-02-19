@@ -3,15 +3,8 @@
 import os
 import time
 import logging
-from browser import create_browser, inject_cookies
-from checkin import (
-    BASE_URL,
-    USER_PAGE,
-    COOKIE_DOMAIN,
-    wait_login_success,
-    get_username,
-    do_checkin,
-)
+from browser import create_browser
+from checkin import do_login, do_checkin, get_username_from_page, BASE_URL
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,33 +14,60 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def process_account(cookie: str) -> str:
+def parse_accounts(env_value: str) -> list:
+    """
+    解析账号配置，支持格式：
+    username----password
+    多账号换行
+    """
+    accounts = []
+    for line in env_value.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "----" in line:
+            parts = line.split("----", 1)
+            if len(parts) == 2:
+                accounts.append({
+                    "username": parts[0].strip(),
+                    "password": parts[1].strip()
+                })
+    return accounts
+
+
+def process_account(username: str, password: str) -> str:
+    """处理单个账号"""
     driver = create_browser()
     if not driver:
-        return "[❌] 浏览器启动失败"
+        return f"[❌] {username} 浏览器启动失败"
 
     try:
-        inject_cookies(driver, BASE_URL, cookie, COOKIE_DOMAIN)
-        driver.get(USER_PAGE)
-        time.sleep(3)  # 等待页面加载
-
-        if not wait_login_success(driver):
-            # 保存截图用于调试
+        # 登录
+        if not do_login(driver, username, password):
             try:
                 driver.save_screenshot("/tmp/login_failed.png")
-                log.info("📸 已保存截图: /tmp/login_failed.png")
             except Exception:
                 pass
-            return "[❌] 登录失败，Cookie 可能失效"
+            return f"[❌] {username} 登录失败"
 
-        username = get_username(driver)
-        if username == "unknown":
-            log.warning("⚠️ 无法获取用户名，尝试从 Cookie 解析")
-            # 可选：从 Cookie 中解析用户名
-            
-        log.info(f"👤 当前账号: {username}")
+        # 获取实际用户名（确认登录成功）
+        actual_user = get_username_from_page(driver)
+        if actual_user != "unknown":
+            log.info(f"👤 当前账号: {actual_user}")
+
+        # 等待页面完全加载
+        time.sleep(2)
+        
+        # 访问首页确保签到按钮可见
+        driver.get(BASE_URL)
+        time.sleep(3)
+
+        # 执行签到
         return do_checkin(driver, username)
 
+    except Exception as e:
+        log.error(f"❌ 处理账号异常: {e}")
+        return f"[❌] {username} 异常: {e}"
     finally:
         try:
             driver.quit()
@@ -56,32 +76,31 @@ def process_account(cookie: str) -> str:
 
 
 def main():
-    if "NL_COOKIE" not in os.environ:
-        print("❌ 未设置 NL_COOKIE 环境变量")
+    env_key = "NL_ACCOUNT"
+    if env_key not in os.environ:
+        print(f"❌ 未设置 {env_key} 环境变量")
+        print("格式: username----password")
         return
 
-    cookies = [
-        line.strip().split("#", 1)[0]
-        for line in os.environ["NL_COOKIE"].splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-    if not cookies:
-        print("❌ NL_COOKIE 为空")
+    accounts = parse_accounts(os.environ[env_key])
+    if not accounts:
+        print("❌ 未找到有效账号")
         return
 
-    log.info(f"✅ 共 {len(cookies)} 个账号，开始签到")
+    log.info(f"✅ 共 {len(accounts)} 个账号，开始签到")
 
     results = []
-    for idx, cookie in enumerate(cookies, 1):
-        log.info(f"--- 账号 {idx}/{len(cookies)} ---")
-        result = process_account(cookie)
+    for idx, acc in enumerate(accounts, 1):
+        log.info(f"--- 账号 {idx}/{len(accounts)}: {acc['username']} ---")
+        result = process_account(acc["username"], acc["password"])
         results.append(result)
-        if idx < len(cookies):
+        log.info(result)
+        
+        if idx < len(accounts):
             time.sleep(5)
 
     log.info("✅ 全部完成")
-    print("\n".join(results))
+    print("\n" + "\n".join(results))
 
 
 if __name__ == "__main__":
