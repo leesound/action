@@ -101,12 +101,16 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
     return False
 
 def logout(sb):
+    """退出登录 - 直接清除 cookies，不点击退出按钮"""
     try:
-        sb.execute_script('(function(){var a=document.querySelector("a[href*=logout]");if(a)a.click();})()')
-        time.sleep(2)
-    except: pass
-    sb.delete_all_cookies()
-    time.sleep(1)
+        # 直接清除所有 cookies 来退出
+        sb.delete_all_cookies()
+        # 导航到一个空白页面，确保完全退出
+        sb.open("about:blank")
+        time.sleep(1)
+        print("[INFO] 已退出登录")
+    except Exception as e:
+        print(f"[WARN] 退出时出错: {e}")
 
 def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     """从 homepage 和 overview 页面获取服务器列表"""
@@ -196,7 +200,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     
     # 点击续期按钮 - 使用 handleServerRenewal 函数
     try:
-        # 方法1: 直接调用页面上的续期函数
         clicked = sb.execute_script(f'''
             (function() {{
                 // 查找续期链接
@@ -243,7 +246,7 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     wait_turnstile(sb, 60)
     time.sleep(5)
     
-    # 保存截图
+    # 保存截图（在续期完成后，刷新页面前）
     sp = shot(idx, f"srv-{sid}")
     sb.save_screenshot(sp)
     result["screenshot"] = sp
@@ -282,6 +285,11 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     else:
         result["message"] = f"状态未知 | 上次: {new_renewal} | 到期: {remain}"
     
+    # 保存结果截图（服务器详情页面）
+    result_shot = shot(idx, f"srv-{sid}-result")
+    sb.save_screenshot(result_shot)
+    result["screenshot"] = result_shot  # 更新为结果截图
+    
     print(f"[INFO] {'✅' if result['success'] else '⚠️'} {result['message']}")
     return result
 
@@ -312,6 +320,13 @@ def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
     ok = sum(1 for s in result["servers"] if s.get("success"))
     result["success"] = ok > 0
     result["message"] = f"{ok}/{len(result['servers'])} 成功"
+    
+    # 保存最终截图（在 dashboard 页面）
+    sb.open(DASHBOARD_URL)
+    time.sleep(2)
+    final_shot = shot(idx, "05-final")
+    sb.save_screenshot(final_shot)
+    result["final_screenshot"] = final_shot
     
     logout(sb)
     return result
@@ -352,18 +367,18 @@ def main():
                 try:
                     r = process(sb, u, p, i)
                     results.append(r)
-                    for s in reversed(r.get("servers", [])):
-                        if s.get("screenshot"):
-                            last_shot = s["screenshot"]
-                            break
+                    # 优先使用 final_screenshot，其次使用服务器截图
+                    if r.get("final_screenshot"):
+                        last_shot = r["final_screenshot"]
+                    else:
+                        for s in reversed(r.get("servers", [])):
+                            if s.get("screenshot"):
+                                last_shot = s["screenshot"]
+                                break
                     time.sleep(3)
                 except Exception as e:
                     print(f"[ERROR] 账号 {u} 异常: {e}")
                     results.append({"username": u, "success": False, "message": str(e), "servers": []})
-            
-            final = shot(0, "final")
-            sb.save_screenshot(final)
-            last_shot = final
             
     except Exception as e:
         print(f"[ERROR] 脚本异常: {e}")
