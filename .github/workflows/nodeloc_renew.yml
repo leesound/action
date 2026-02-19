@@ -1,4 +1,4 @@
-# .github/workflows/checkin.yml
+# .github/workflows/nodeloc_renew.yml
 name: NodeLoc 每日签到
 
 on:
@@ -32,12 +32,14 @@ jobs:
           chrome-version: 131
 
       - name: 安装Python依赖
-        run: pip install undetected-chromedriver selenium
+        run: pip install undetected-chromedriver selenium requests
 
       - name: 执行签到脚本
         env:
           NL_ACCOUNT: ${{ secrets.NL_ACCOUNT }}
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python nodeloc/main.py
 
       - name: 上传调试截图
