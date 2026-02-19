@@ -3,37 +3,36 @@ name: NodeLoc 每日签到
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # UTC 22:00 = 北京时间 06:00
+    - cron: '0 22 * * *'
   workflow_dispatch:
     inputs:
       debug:
-        description: '调试模式（保存截图）'
+        description: '调试模式'
         required: false
         default: 'false'
         type: boolean
 
 jobs:
-  签到:
+  checkin:
     name: 执行签到
     runs-on: ubuntu-latest
-    
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 配置 Python 环境
+      - name: 配置Python环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 安装 Chrome 浏览器
+      - name: 安装Chrome浏览器
         run: |
           wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
 
-      - name: 安装 Python 依赖
+      - name: 安装Python依赖
         run: pip install undetected-chromedriver selenium
 
       - name: 执行签到脚本
@@ -45,7 +44,7 @@ jobs:
         if: failure() || github.event.inputs.debug == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: 调试截图
+          name: debug-screenshots
           path: /tmp/*.png
           retention-days: 3
           if-no-files-found: ignore
