@@ -25,14 +25,69 @@ jobs:
 
       - name: 安装依赖
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb
+          sudo apt-get update && sudo apt-get install -y xvfb unzip
           pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
+
+      - name: 安装并启动 Xray 代理
+        env:
+          VLESS_URL: ${{ secrets.VLESS_URL }}
+        run: |
+          # 下载 Xray
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
+          
+          # 生成配置
+          python3 << 'PYEOF'
+          import os, sys, json
+          from urllib.parse import parse_qs, unquote
+
+          url = os.environ.get("VLESS_URL", "").strip()
+          if not url or not url.startswith("vless://"):
+              print("[ERROR] 无效的 VLESS_URL"); sys.exit(1)
+
+          url = url[8:]
+          if "#" in url: url = url.rsplit("#", 1)[0]
+          uuid, rest = url.split("@", 1)
+          host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
+          address, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443"))
+          params = parse_qs(params_str)
+
+          config = {
+              "log": {"loglevel": "warning"},
+              "inbounds": [
+                  {"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
+                  {"port": 10809, "listen": "127.0.0.1", "protocol": "http"}
+              ],
+              "outbounds": [{
+                  "protocol": "vless",
+                  "settings": {"vnext": [{"address": address, "port": int(port), "users": [{"id": uuid, "encryption": "none"}]}]},
+                  "streamSettings": {
+                      "network": params.get("type", ["tcp"])[0],
+                      "security": params.get("security", ["none"])[0],
+                      **({"tlsSettings": {"serverName": params.get("sni", [address])[0], "fingerprint": params.get("fp", ["chrome"])[0]}} if params.get("security", ["none"])[0] == "tls" else {}),
+                      **({"wsSettings": {"path": unquote(params.get("path", ["/"])[0]), "headers": {"Host": params.get("host", [address])[0]}}} if params.get("type", ["tcp"])[0] == "ws" else {})
+                  }
+              }]
+          }
+          with open("xray_config.json", "w") as f: json.dump(config, f)
+          print(f"[INFO] Xray 配置已生成: {address}:{port}")
+          PYEOF
+          
+          # 启动 Xray
+          ./xray/xray run -c xray_config.json &
+          sleep 5
+          
+          # 测试代理
+          echo "[INFO] 测试代理连接..."
+          PROXY_IP=$(curl -x socks5://127.0.0.1:10808 -s --max-time 15 https://api.ipify.org || echo "获取失败")
+          echo "[INFO] 代理 IP: $PROXY_IP"
 
       - name: 执行续期
         env:
           ZAMPTO_ACCOUNT: ${{ secrets.ZAMPTO_ACCOUNT }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_SOCKS5: "socks5://127.0.0.1:10808"
         run: python scripts/zampto_renew.py
 
       - name: 上传截图
