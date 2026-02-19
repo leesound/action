@@ -1,343 +1,229 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zampto 自动续期脚本 - 支持多账号"""
+"""Zampto 自动续期脚本"""
 
-import os
-import sys
-import time
-import platform
-import requests
-import re
+import os, sys, time, platform, requests, re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
-
 from seleniumbase import SB
 
 AUTH_URL = "https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
 DASHBOARD_URL = "https://dash.zampto.net/homepage"
-SERVER_URL_TEMPLATE = "https://dash.zampto.net/server?id={}"
+SERVER_URL = "https://dash.zampto.net/server?id={}"
 OUTPUT_DIR = Path("output/screenshots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def is_linux() -> bool:
-    return platform.system().lower() == "linux"
-
+def is_linux(): return platform.system().lower() == "linux"
 
 def setup_display():
     if is_linux() and not os.environ.get("DISPLAY"):
         try:
             from pyvirtualdisplay import Display
-            display = Display(visible=False, size=(1920, 1080))
-            display.start()
-            os.environ["DISPLAY"] = display.new_display_var
-            print("[INFO] 已启动虚拟显示")
-            return display
+            d = Display(visible=False, size=(1920, 1080))
+            d.start()
+            os.environ["DISPLAY"] = d.new_display_var
+            print("[INFO] 虚拟显示已启动")
+            return d
         except Exception as e:
-            print(f"[ERROR] 虚拟显示失败: {e}")
-            sys.exit(1)
+            print(f"[ERROR] 虚拟显示失败: {e}"); sys.exit(1)
     return None
 
+def shot(idx: int, name: str) -> str:
+    return str(OUTPUT_DIR / f"acc{idx}-{datetime.now().strftime('%H%M%S')}-{name}.png")
 
-def screenshot_path(acc_idx: int, name: str) -> str:
-    return str(OUTPUT_DIR / f"acc{acc_idx}-{datetime.now().strftime('%H%M%S')}-{name}.png")
-
-
-def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = None):
+def notify(ok: bool, stage: str, msg: str = "", img: str = None):
+    token, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not token or not chat: return
     try:
-        token = os.environ.get("TG_BOT_TOKEN")
-        chat_id = os.environ.get("TG_CHAT_ID")
-        if not token or not chat_id:
-            return
+        text = f"🔔 Zampto: {'✅' if ok else '❌'} {stage}\n{msg}\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": text}, timeout=30)
+        if img and Path(img).exists():
+            with open(img, "rb") as f:
+                requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data={"chat_id": chat}, files={"photo": f}, timeout=60)
+    except: pass
 
-        emoji = "✅" if ok else "❌"
-        text = f"🔔 Zampto 续期：{emoji} {stage}\n{msg}\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+def parse_accounts(s: str) -> List[Tuple[str, str]]:
+    return [(p[0].strip(), p[1].strip()) for line in s.strip().split('\n') 
+            if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
 
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-            timeout=30
-        )
-
-        if screenshot_file and Path(screenshot_file).exists():
-            with open(screenshot_file, "rb") as f:
-                requests.post(
-                    f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={"chat_id": chat_id, "caption": f"截图（{stage}）"},
-                    files={"photo": f},
-                    timeout=60
-                )
-    except Exception as e:
-        print(f"[WARN] Telegram 通知失败: {e}")
-
-
-def parse_accounts(account_str: str) -> List[Tuple[str, str]]:
-    accounts = []
-    for line in account_str.strip().split('\n'):
-        line = line.strip()
-        if not line or '----' not in line:
-            continue
-        parts = line.split('----', 1)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            accounts.append((parts[0].strip(), parts[1].strip()))
-    return accounts
-
-
-def wait_for_turnstile(sb, max_wait: int = 60) -> bool:
-    print("[INFO] 等待 Turnstile 验证...")
-    for i in range(max_wait):
+def wait_turnstile(sb, wait: int = 60) -> bool:
+    for i in range(wait):
         try:
-            result = sb.execute_script('''
-                var cf = document.querySelector('input[name="cf-turnstile-response"]');
-                if (cf && cf.value && cf.value.length > 20) return "token";
-                var success = document.querySelector('[data-success="true"], .cf-turnstile-success');
-                if (success) return "success";
-                return null;
-            ''')
-            if result:
-                print("[INFO] ✅ Turnstile 验证完成")
-                return True
-        except:
-            pass
-        if i % 10 == 0 and i > 0:
-            print(f"[INFO] 等待验证中... ({i}/{max_wait}s)")
+            if sb.execute_script('var c=document.querySelector("input[name=cf-turnstile-response]");return c&&c.value.length>20'):
+                print("[INFO] ✅ Turnstile 完成"); return True
+        except: pass
+        if i % 15 == 0 and i: print(f"[INFO] 等待验证... {i}s")
         time.sleep(1)
     return False
 
-
-def login_zampto(sb, username: str, password: str, acc_idx: int) -> bool:
-    print(f"\n{'='*50}\n[INFO] 账号 {acc_idx}: 登录 {username}\n{'='*50}")
-    
+def login(sb, user: str, pwd: str, idx: int) -> bool:
+    print(f"\n{'='*50}\n[INFO] 账号 {idx}: 登录 {user}\n{'='*50}")
     sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=8.0)
-    time.sleep(3)
-    sb.save_screenshot(screenshot_path(acc_idx, "01-login"))
+    time.sleep(3); sb.save_screenshot(shot(idx, "01-login"))
     
     if "dash.zampto.net" in sb.get_current_url():
-        print("[INFO] ✅ 已登录")
-        return True
+        print("[INFO] ✅ 已登录"); return True
     
-    try:
-        sb.wait_for_element('input[name="identifier"]', timeout=20)
-    except:
-        print("[ERROR] 未找到登录表单")
-        return False
+    try: sb.wait_for_element('input[name="identifier"]', timeout=20)
+    except: print("[ERROR] 未找到登录表单"); return False
     
-    sb.type('input[name="identifier"]', username)
-    time.sleep(1)
-    sb.click('button[type="submit"][name="submit"]')
-    time.sleep(3)
+    sb.type('input[name="identifier"]', user); time.sleep(1)
+    sb.click('button[type="submit"]'); time.sleep(3)
     
-    try:
-        sb.wait_for_element('input[name="password"]', timeout=15)
-    except:
-        print("[ERROR] 未跳转到密码页面")
-        return False
+    try: sb.wait_for_element('input[name="password"]', timeout=15)
+    except: print("[ERROR] 密码页面未加载"); return False
     
-    sb.type('input[name="password"]', password)
-    time.sleep(1)
-    sb.click('button[type="submit"][name="submit"]')
-    time.sleep(5)
-    sb.save_screenshot(screenshot_path(acc_idx, "02-login-result"))
+    sb.type('input[name="password"]', pwd); time.sleep(1)
+    sb.click('button[type="submit"]'); time.sleep(5)
+    sb.save_screenshot(shot(idx, "02-result"))
     
     if "dash.zampto.net" in sb.get_current_url() or "sign-in" not in sb.get_current_url():
-        print("[INFO] ✅ 登录成功")
-        return True
-    print("[ERROR] 登录失败")
-    return False
+        print("[INFO] ✅ 登录成功"); return True
+    print("[ERROR] 登录失败"); return False
 
+def logout(sb):
+    try: sb.execute_script('var a=document.querySelector("a[href*=logout]");if(a)a.click()'); time.sleep(2)
+    except: pass
+    sb.delete_all_cookies(); time.sleep(1)
 
-def logout_zampto(sb):
-    try:
-        sb.execute_script('var a = document.querySelector("a[href*=logout]"); if(a) a.click();')
-        time.sleep(2)
-    except:
-        pass
-    sb.delete_all_cookies()
-    time.sleep(1)
-
-
-def get_all_servers(sb, acc_idx: int) -> List[Dict[str, str]]:
-    print("[INFO] 获取服务器列表...")
-    sb.open(DASHBOARD_URL)
-    time.sleep(3)
-    sb.save_screenshot(screenshot_path(acc_idx, "03-dashboard"))
+def get_servers(sb, idx: int) -> List[Dict[str, str]]:
+    print("[INFO] 获取服务器...")
+    sb.open(DASHBOARD_URL); time.sleep(5)
+    sb.save_screenshot(shot(idx, "03-dashboard"))
+    
+    src = sb.get_page_source()
+    if "Access Blocked" in src or "VPN" in src:
+        print("[ERROR] ⚠️ 访问被阻止"); return []
     
     servers = sb.execute_script('''
-        var servers = [];
-        document.querySelectorAll('.server-item').forEach(function(item) {
-            var link = item.querySelector('a[href*="/server?id="]');
-            var nameEl = item.querySelector('h3');
-            if (link) {
-                var match = link.href.match(/id=(\\d+)/);
-                if (match) servers.push({ id: match[1], name: nameEl ? nameEl.textContent.trim().split('\\n')[0].trim() : 'Server ' + match[1] });
-            }
-        });
-        if (!servers.length) {
-            document.querySelectorAll('a[href*="/server?id="]').forEach(function(link) {
-                var match = link.href.match(/id=(\\d+)/);
-                if (match && !servers.some(s => s.id === match[1])) servers.push({ id: match[1], name: 'Server ' + match[1] });
-            });
-        }
-        return servers;
-    ''')
+        var s=[];document.querySelectorAll('a[href*="/server?id="]').forEach(function(a){
+            var m=a.href.match(/id=(\\d+)/);if(m&&!s.some(x=>x.id===m[1]))s.push({id:m[1],name:'Server '+m[1]})
+        });return s
+    ''') or []
     
     if not servers:
-        matches = re.findall(r'/server\?id=(\d+)', sb.get_page_source())
-        servers = [{"id": sid, "name": f"Server {sid}"} for sid in set(matches)]
+        servers = [{"id": m, "name": f"Server {m}"} for m in set(re.findall(r'/server\?id=(\d+)', src))]
     
     print(f"[INFO] 找到 {len(servers)} 个服务器")
-    for s in servers:
-        print(f"  - {s['name']} (ID: {s['id']})")
     return servers
 
-
-def renew_server(sb, server_id: str, acc_idx: int) -> Dict[str, Any]:
-    result = {"server_id": server_id, "success": False, "message": "", "screenshot": None}
+def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
+    result = {"server_id": sid, "success": False, "message": "", "screenshot": None}
+    print(f"[INFO] 续期 {sid}...")
     
-    print(f"[INFO] 续期服务器 {server_id}...")
-    sb.open(SERVER_URL_TEMPLATE.format(server_id))
-    time.sleep(2)
+    sb.open(SERVER_URL.format(sid)); time.sleep(3)
+    if "Access Blocked" in sb.get_page_source():
+        result["message"] = "被阻止"; return result
     
-    old_renewal = sb.execute_script('var el = document.getElementById("lastRenewalTime"); return el ? el.textContent.trim() : "";')
+    old = sb.execute_script('var e=document.getElementById("lastRenewalTime");return e?e.textContent:""')
     
     try:
         clicked = sb.execute_script(f'''
-            var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
-            for (var i = 0; i < links.length; i++) if (links[i].getAttribute('onclick').includes('{server_id}')) {{ links[i].click(); return true; }}
-            if (typeof handleServerRenewal === 'function') {{ handleServerRenewal(null, {server_id}); return true; }}
-            return false;
+            var a=document.querySelectorAll('a[onclick*="handleServerRenewal"]');
+            for(var i=0;i<a.length;i++)if(a[i].onclick.toString().includes('{sid}')){{a[i].click();return true}}
+            if(typeof handleServerRenewal==='function'){{handleServerRenewal(null,{sid});return true}}
+            return false
         ''')
-        if not clicked:
-            result["message"] = "未找到续期按钮"
-            return result
-    except Exception as e:
-        result["message"] = f"点击失败: {e}"
-        return result
+        if not clicked: result["message"] = "无续期按钮"; return result
+    except Exception as e: result["message"] = str(e); return result
     
     time.sleep(2)
-    try:
-        sb.uc_gui_click_captcha()
-        time.sleep(3)
-    except:
-        pass
+    try: sb.uc_gui_click_captcha(); time.sleep(3)
+    except: pass
+    wait_turnstile(sb, 45); time.sleep(3)
     
-    wait_for_turnstile(sb, max_wait=45)
-    time.sleep(3)
+    sp = shot(idx, f"srv-{sid}"); sb.save_screenshot(sp); result["screenshot"] = sp
     
-    sp = screenshot_path(acc_idx, f"server-{server_id}")
-    sb.save_screenshot(sp)
-    result["screenshot"] = sp
-    
-    sb.open(SERVER_URL_TEMPLATE.format(server_id))
-    time.sleep(2)
-    
-    new_renewal = sb.execute_script('var el = document.getElementById("lastRenewalTime"); return el ? el.textContent.trim() : "";')
-    new_remaining = sb.execute_script('var el = document.getElementById("nextRenewalTime"); return el ? el.textContent.trim() : "";')
+    sb.open(SERVER_URL.format(sid)); time.sleep(2)
+    new = sb.execute_script('var e=document.getElementById("lastRenewalTime");return e?e.textContent:""')
+    remain = sb.execute_script('var e=document.getElementById("nextRenewalTime");return e?e.textContent:""')
     
     today = datetime.now().strftime('%b %d, %Y')
-    if new_renewal != old_renewal:
-        result["success"], result["message"] = True, f"续期成功 | 到期: {new_remaining}"
-    elif today in str(new_renewal):
-        result["success"], result["message"] = True, f"已续期 | 到期: {new_remaining}"
-    elif "1 day" in new_remaining or "2 day" in new_remaining:
-        result["success"], result["message"] = True, f"续期可能成功 | 到期: {new_remaining}"
-    else:
-        result["message"] = f"状态未知 | 到期: {new_remaining}"
+    if new != old: result["success"], result["message"] = True, f"成功 | 到期: {remain}"
+    elif today in str(new): result["success"], result["message"] = True, f"已续期 | 到期: {remain}"
+    elif any(x in str(remain) for x in ["1 day", "2 day"]): result["success"], result["message"] = True, f"可能成功 | {remain}"
+    else: result["message"] = f"未知 | {remain}"
     
     print(f"[INFO] {'✅' if result['success'] else '❌'} {result['message']}")
     return result
 
-
-def process_account(sb, username: str, password: str, acc_idx: int) -> Dict[str, Any]:
-    result = {"username": username, "success": False, "message": "", "servers": []}
+def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
+    result = {"username": user, "success": False, "message": "", "servers": []}
     
-    if not login_zampto(sb, username, password, acc_idx):
-        result["message"] = "登录失败"
-        return result
+    if not login(sb, user, pwd, idx):
+        result["message"] = "登录失败"; return result
     
-    servers = get_all_servers(sb, acc_idx)
+    servers = get_servers(sb, idx)
     if not servers:
-        result["message"] = "无服务器"
-        logout_zampto(sb)
-        return result
+        result["message"] = "无服务器"; logout(sb); return result
     
-    for server in servers:
+    for srv in servers:
         try:
-            srv_result = renew_server(sb, server["id"], acc_idx)
-            srv_result["name"] = server.get("name", f"Server {server['id']}")
-            result["servers"].append(srv_result)
+            r = renew(sb, srv["id"], idx)
+            r["name"] = srv.get("name", srv["id"])
+            result["servers"].append(r)
             time.sleep(2)
         except Exception as e:
-            result["servers"].append({"server_id": server["id"], "name": server.get("name"), "success": False, "message": str(e)})
+            result["servers"].append({"server_id": srv["id"], "success": False, "message": str(e)})
     
-    success_count = sum(1 for s in result["servers"] if s.get("success"))
-    result["success"] = success_count > 0
-    result["message"] = f"{success_count}/{len(result['servers'])} 服务器续期成功"
-    
-    logout_zampto(sb)
-    return result
-
+    ok = sum(1 for s in result["servers"] if s.get("success"))
+    result["success"] = ok > 0
+    result["message"] = f"{ok}/{len(result['servers'])} 成功"
+    logout(sb); return result
 
 def main():
-    account_str = os.environ.get("ZAMPTO_ACCOUNT", "")
-    if not account_str:
-        print("[ERROR] 缺少环境变量 ZAMPTO_ACCOUNT")
-        sys.exit(1)
+    acc_str = os.environ.get("ZAMPTO_ACCOUNT", "")
+    if not acc_str: print("[ERROR] 缺少 ZAMPTO_ACCOUNT"); sys.exit(1)
     
-    accounts = parse_accounts(account_str)
-    if not accounts:
-        print("[ERROR] 未解析到有效账号")
-        sys.exit(1)
+    accounts = parse_accounts(acc_str)
+    if not accounts: print("[ERROR] 无有效账号"); sys.exit(1)
+    print(f"[INFO] {len(accounts)} 个账号")
     
-    print(f"[INFO] 解析到 {len(accounts)} 个账号")
+    proxy = os.environ.get("PROXY_SOCKS5", "")
+    if proxy:
+        try:
+            ip = requests.get("https://api.ipify.org", proxies={"http": proxy, "https": proxy}, timeout=10).text
+            print(f"[INFO] 代理IP: {ip}")
+        except: pass
     
     display = setup_display()
-    all_results = []
-    last_screenshot = None
+    results, last_shot = [], None
     
     try:
-        with SB(uc=True, test=True, locale="en", headed=not is_linux(), chromium_arg="--disable-blink-features=AutomationControlled") as sb:
-            for idx, (username, password) in enumerate(accounts, 1):
+        opts = {"uc": True, "test": True, "locale": "en", "headed": not is_linux()}
+        if proxy: opts["proxy"] = proxy.replace("socks5://", "socks5://")
+        
+        with SB(**opts) as sb:
+            for i, (u, p) in enumerate(accounts, 1):
                 try:
-                    result = process_account(sb, username, password, idx)
-                    all_results.append(result)
-                    for srv in reversed(result.get("servers", [])):
-                        if srv.get("screenshot"):
-                            last_screenshot = srv["screenshot"]
-                            break
+                    r = process(sb, u, p, i)
+                    results.append(r)
+                    for s in reversed(r.get("servers", [])):
+                        if s.get("screenshot"): last_shot = s["screenshot"]; break
                     time.sleep(3)
                 except Exception as e:
-                    print(f"[ERROR] 账号 {username} 处理失败: {e}")
-                    all_results.append({"username": username, "success": False, "message": str(e), "servers": []})
+                    results.append({"username": u, "success": False, "message": str(e), "servers": []})
             
-            final_sp = screenshot_path(0, "final")
-            sb.save_screenshot(final_sp)
-            last_screenshot = final_sp
+            final = shot(0, "final"); sb.save_screenshot(final); last_shot = final
     except Exception as e:
-        print(f"[ERROR] 脚本执行失败: {e}")
-        notify_telegram(False, "脚本错误", str(e))
-        sys.exit(1)
+        print(f"[ERROR] {e}"); notify(False, "错误", str(e)); sys.exit(1)
     finally:
-        if display:
-            display.stop()
+        if display: display.stop()
     
-    # 汇总
-    success_accounts = sum(1 for r in all_results if r.get("success"))
-    total_servers = sum(len(r.get("servers", [])) for r in all_results)
-    success_servers = sum(sum(1 for s in r.get("servers", []) if s.get("success")) for r in all_results)
+    ok_acc = sum(1 for r in results if r.get("success"))
+    total_srv = sum(len(r.get("servers", [])) for r in results)
+    ok_srv = sum(sum(1 for s in r.get("servers", []) if s.get("success")) for r in results)
     
-    summary = f"📊 账号: {success_accounts}/{len(all_results)} | 服务器: {success_servers}/{total_servers}\n{'─'*30}\n"
-    for r in all_results:
-        summary += f"{'✅' if r.get('success') else '❌'} {r['username']}: {r.get('message', '')}\n"
-        for srv in r.get("servers", []):
-            summary += f"  {'✓' if srv.get('success') else '✗'} {srv.get('name', srv['server_id'])}: {srv.get('message', '')}\n"
+    summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
+    for r in results:
+        summary += f"{'✅' if r.get('success') else '❌'} {r['username']}: {r.get('message','')}\n"
+        for s in r.get("servers", []):
+            summary += f"  {'✓' if s.get('success') else '✗'} {s.get('name',s['server_id'])}: {s.get('message','')}\n"
     
-    print(f"\n{'='*50}\n[结果汇总]\n{summary}{'='*50}")
-    
-    notify_telegram(success_accounts == len(all_results) and success_servers == total_servers, "完成", summary, last_screenshot)
-    sys.exit(0 if success_servers > 0 else 1)
-
+    print(f"\n{'='*50}\n{summary}{'='*50}")
+    notify(ok_acc == len(results) and ok_srv == total_srv, "完成", summary, last_shot)
+    sys.exit(0 if ok_srv > 0 else 1)
 
 if __name__ == "__main__":
     main()
