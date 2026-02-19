@@ -1,5 +1,6 @@
 # nodeloc/main.py
 import os
+import json
 import logging
 import requests
 from browser import create_browser
@@ -14,45 +15,25 @@ logging.basicConfig(
 )
 
 def mask_username(username):
-    """隐藏用户名，只显示首尾字符"""
+    """隐藏用户名"""
     if len(username) <= 2:
         return username[0] + '*'
     return username[0] + '*' * (len(username) - 2) + username[-1]
 
 def send_telegram(message):
-    """发送Telegram通知"""
+    """发送TG通知"""
     token = os.environ.get('TG_BOT_TOKEN')
     chat_id = os.environ.get('TG_CHAT_ID')
-    
     if not token or not chat_id:
         return
-    
-    url = f'https://api.telegram.org/bot{token}/sendMessage'
-    data = {
-        'chat_id': chat_id,
-        'text': message,
-        'parse_mode': 'HTML'
-    }
-    
     try:
-        requests.post(url, data=data, timeout=10)
+        requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            data={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'},
+            timeout=10
+        )
     except Exception as e:
         logging.error(f'TG通知失败: {e}')
-
-def parse_accounts(account_str):
-    """解析账号配置，格式：username:password，每行一个"""
-    accounts = []
-    for line in account_str.strip().split('\n'):
-        line = line.strip()
-        if not line or ':' not in line:
-            continue
-        parts = line.split(':', 1)
-        if len(parts) == 2:
-            accounts.append({
-                'username': parts[0].strip(),
-                'password': parts[1].strip()
-            })
-    return accounts
 
 def process_account(username, password):
     """处理单个账号签到"""
@@ -63,7 +44,6 @@ def process_account(username, password):
         driver = create_browser()
         wait = WebDriverWait(driver, 15)
         
-        # 登录
         logging.info(f'🔐 开始登录: {masked}')
         driver.get('https://www.nodeloc.com/login')
         
@@ -73,16 +53,16 @@ def process_account(username, password):
         
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'header .SessionDropdown')))
         logging.info('✅ 登录成功')
+        logging.info(f'👤 当前账号: {masked}')
         
-        # 签到
         logging.info(f'📌 {masked} 执行签到')
         driver.get('https://www.nodeloc.com')
         
         checkin_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.checkin-button')))
+        logging.info('✅ 找到签到按钮: button.checkin-button')
         checkin_btn.click()
         logging.info('🖱️ 已点击签到按钮')
         
-        # 等待弹窗
         alert = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '.AlertManager .Alert')))
         msg = alert.text.strip()
         logging.info(f'🔔 弹窗内容: {msg}')
@@ -96,25 +76,21 @@ def process_account(username, password):
             
     except Exception as e:
         logging.error(f'❌ 签到失败: {e}')
-        if driver:
-            driver.save_screenshot(f'/tmp/error_{masked}.png')
         return 'failed', f'{masked} 签到失败'
-        
     finally:
         if driver:
             driver.quit()
 
 def main():
     account_str = os.environ.get('NL_ACCOUNT', '')
-    
     if not account_str:
         logging.error('❌ 未配置 NL_ACCOUNT')
         return
     
-    accounts = parse_accounts(account_str)
-    
-    if not accounts:
-        logging.error('❌ 账号列表为空，格式：username:password，每行一个')
+    try:
+        accounts = json.loads(account_str)
+    except:
+        logging.error('❌ NL_ACCOUNT 格式错误，请使用JSON格式')
         return
     
     logging.info(f'✅ 共 {len(accounts)} 个账号，开始签到')
@@ -125,22 +101,16 @@ def main():
         logging.info(f'--- 账号 {i}/{len(accounts)}: {masked} ---')
         status, msg = process_account(acc['username'], acc['password'])
         
-        if status == 'success':
-            results.append(f'✅ {msg}')
-        elif status == 'skipped':
-            results.append(f'⏭️ {msg}')
-        else:
-            results.append(f'❌ {msg}')
-        
-        logging.info(results[-1])
+        icon = {'success': '✅', 'skipped': '⏭️'}.get(status, '❌')
+        results.append(f'{icon} {msg}')
+        logging.info(f'[{icon}] {msg}')
     
     logging.info('✅ 全部完成')
     
-    # 发送TG通知
+    # TG通知
     tg_msg = '<b>📋 NodeLoc 签到结果</b>\n\n' + '\n'.join(results)
     send_telegram(tg_msg)
     
-    # 输出结果
     print('\n'.join(results))
 
 if __name__ == '__main__':
