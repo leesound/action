@@ -1,14 +1,5 @@
 # nodeloc/browser.py
-# -*- coding: utf-8 -*-
-"""
-浏览器管理
-"""
-
-import logging
 import undetected_chromedriver as uc
-
-log = logging.getLogger(__name__)
-
 
 def create_browser():
     options = uc.ChromeOptions()
@@ -23,6 +14,3 @@ def create_browser():
         version_main=131
     )
     return driver
-    except Exception as e:
-        log.error(f"❌ 浏览器启动失败: {e}")
-        return None
