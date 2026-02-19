@@ -3,7 +3,7 @@
 """Zampto 自动续期脚本"""
 
 import os, sys, time, platform, requests, re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from seleniumbase import SB
@@ -15,8 +15,47 @@ SERVER_URL = "https://dash.zampto.net/server?id={}"
 OUTPUT_DIR = Path("output/screenshots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# 中国时区
+CN_TZ = timezone(timedelta(hours=8))
+
+def cn_now() -> datetime:
+    """获取中国时区当前时间"""
+    return datetime.now(CN_TZ)
+
+def cn_time_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """获取中国时区时间字符串"""
+    return cn_now().strftime(fmt)
+
+def parse_renewal_time(time_str: str) -> str:
+    """将网站时间(UTC)转换为中国时区格式"""
+    if not time_str:
+        return "未知"
+    try:
+        # 解析 "Feb 19, 2026 5:36 PM" 格式
+        dt = datetime.strptime(time_str, "%b %d, %Y %I:%M %p")
+        # 设为 UTC 时区
+        dt = dt.replace(tzinfo=timezone.utc)
+        # 转换为中国时区
+        dt_cn = dt.astimezone(CN_TZ)
+        return dt_cn.strftime("%Y年%m月%d日 %H时%M分")
+    except:
+        return time_str
+
+def calc_expiry_time(renewal_time_str: str, minutes: int = 2880) -> str:
+    """根据续期时间计算到期时间"""
+    if not renewal_time_str:
+        return "未知"
+    try:
+        dt = datetime.strptime(renewal_time_str, "%b %d, %Y %I:%M %p")
+        dt = dt.replace(tzinfo=timezone.utc)
+        expiry = dt + timedelta(minutes=minutes)
+        expiry_cn = expiry.astimezone(CN_TZ)
+        return expiry_cn.strftime("%Y年%m月%d日 %H时%M分")
+    except:
+        return "未知"
+
 def mask(s: str, show: int = 1) -> str:
-    """隐藏敏感信息，只显示前几个字符"""
+    """隐藏敏感信息"""
     if not s: return "***"
     s = str(s)
     if len(s) <= show: return s[0] + "***"
@@ -38,13 +77,13 @@ def setup_display():
     return None
 
 def shot(idx: int, name: str) -> str:
-    return str(OUTPUT_DIR / f"acc{idx}-{datetime.now().strftime('%H%M%S')}-{name}.png")
+    return str(OUTPUT_DIR / f"acc{idx}-{cn_now().strftime('%H%M%S')}-{name}.png")
 
 def notify(ok: bool, stage: str, msg: str = "", img: str = None):
     token, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
     if not token or not chat: return
     try:
-        text = f"🔔 Zampto: {'✅' if ok else '❌'} {stage}\n{msg}\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        text = f"🔔 Zampto: {'✅' if ok else '❌'} {stage}\n{msg}\n⏰ {cn_time_str()}"
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": text}, timeout=30)
         if img and Path(img).exists():
             with open(img, "rb") as f:
@@ -109,7 +148,6 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
     return False
 
 def logout(sb):
-    """退出登录 - 直接清除 cookies"""
     try:
         sb.delete_all_cookies()
         sb.open("about:blank")
@@ -119,7 +157,6 @@ def logout(sb):
         print(f"[WARN] 退出时出错: {e}")
 
 def get_servers(sb, idx: int) -> List[Dict[str, str]]:
-    """从 homepage 和 overview 页面获取服务器列表"""
     print("[INFO] 获取服务器列表...")
     servers = []
     seen_ids = set()
@@ -175,9 +212,9 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     return servers
 
 def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
-    """续期单个服务器"""
     sid_masked = mask(sid)
-    result = {"server_id": sid, "success": False, "message": "", "screenshot": None}
+    result = {"server_id": sid, "success": False, "message": "", "screenshot": None, 
+              "old_time": "", "new_time": "", "old_time_cn": "", "new_time_cn": "", "expiry_cn": ""}
     print(f"[INFO] 续期服务器 {sid_masked}...")
     
     sb.open(SERVER_URL.format(sid))
@@ -188,6 +225,7 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         result["message"] = "访问被阻止"
         return result
     
+    # 获取续期前时间
     old_renewal = ""
     try:
         old_renewal = sb.execute_script('''
@@ -198,8 +236,11 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         ''')
     except: pass
     
+    result["old_time"] = old_renewal
+    result["old_time_cn"] = parse_renewal_time(old_renewal)
     print(f"[INFO] 续期前时间: {old_renewal}")
     
+    # 点击续期按钮
     try:
         clicked = sb.execute_script(f'''
             (function() {{
@@ -245,6 +286,7 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     sb.save_screenshot(sp)
     result["screenshot"] = sp
     
+    # 刷新页面获取新时间
     sb.open(SERVER_URL.format(sid))
     time.sleep(3)
     
@@ -265,17 +307,25 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         ''')
     except: pass
     
+    result["new_time"] = new_renewal
+    result["new_time_cn"] = parse_renewal_time(new_renewal)
+    result["expiry_cn"] = calc_expiry_time(new_renewal)
+    
     print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
     
+    # 判断是否成功
     today = datetime.now().strftime('%b %d, %Y')
     if new_renewal and new_renewal != old_renewal:
-        result["success"], result["message"] = True, f"成功 | 到期: {remain}"
+        result["success"] = True
+        result["message"] = f"{result['old_time_cn']} -> {result['expiry_cn']}"
     elif today in str(new_renewal):
-        result["success"], result["message"] = True, f"今日已续期 | 到期: {remain}"
+        result["success"] = True
+        result["message"] = f"今日已续期 | {result['new_time_cn']} -> {result['expiry_cn']}"
     elif remain and ("1 day" in remain or "2 day" in remain or "hour" in remain):
-        result["success"], result["message"] = True, f"续期成功 | 到期: {remain}"
+        result["success"] = True
+        result["message"] = f"{result['new_time_cn']} -> {result['expiry_cn']}"
     else:
-        result["message"] = f"状态未知 | 上次: {new_renewal} | 到期: {remain}"
+        result["message"] = f"状态未知 | {result['new_time_cn']}"
     
     result_shot = shot(idx, f"srv-{sid}-result")
     sb.save_screenshot(result_shot)
@@ -285,7 +335,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     return result
 
 def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
-    """处理单个账号"""
     result = {"username": user, "success": False, "message": "", "servers": []}
     
     if not login(sb, user, pwd, idx):
@@ -389,12 +438,13 @@ def main():
     
     print(f"\n{'='*50}\n{log_summary}{'='*50}")
     
-    # 通知（完整信息）
+    # 通知（完整信息，中国时区）
     notify_summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
     for r in results:
         notify_summary += f"{'✅' if r.get('success') else '❌'} {r['username']}: {r.get('message','')}\n"
         for s in r.get("servers", []):
-            notify_summary += f"  {'✓' if s.get('success') else '✗'} Server {s['server_id']}: {s.get('message','')}\n"
+            status = '✓' if s.get('success') else '✗'
+            notify_summary += f"  {status} Server {s['server_id']}: {s.get('message','')}\n"
     
     notify(ok_acc == len(results) and ok_srv == total_srv, "完成", notify_summary, last_shot)
     sys.exit(0 if ok_srv > 0 else 1)
