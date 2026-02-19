@@ -14,9 +14,4 @@ def create_browser():
     if chrome_path:
         options.binary_location = chrome_path
     
-    driver = uc.Chrome(
-        options=options,
-        version_main=131,
-        browser_executable_path=chrome_path
-    )
-    return driver
+    return uc.Chrome(options=options, version_main=131, browser_executable_path=chrome_path)
