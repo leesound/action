@@ -28,15 +28,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y xvfb unzip
           pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
 
-      - name: 安装并启动 Xray 代理
+      - name: 安装并启动代理
         env:
           VLESS_URL: ${{ secrets.VLESS_URL }}
         run: |
-          # 下载 Xray
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
           
-          # 生成配置
           python3 << 'PYEOF'
           import os, sys, json
           from urllib.parse import parse_qs, unquote
@@ -53,7 +51,7 @@ jobs:
           params = parse_qs(params_str)
 
           config = {
-              "log": {"loglevel": "warning"},
+              "log": {"loglevel": "none"},
               "inbounds": [
                   {"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
                   {"port": 10809, "listen": "127.0.0.1", "protocol": "http"}
@@ -70,17 +68,19 @@ jobs:
               }]
           }
           with open("xray_config.json", "w") as f: json.dump(config, f)
-          print(f"[INFO] Xray 配置已生成: {address}:{port}")
+          print("[INFO] 代理配置已生成")
           PYEOF
           
-          # 启动 Xray
-          ./xray/xray run -c xray_config.json &
+          ./xray/xray run -c xray_config.json > /dev/null 2>&1 &
           sleep 5
           
-          # 测试代理
-          echo "[INFO] 测试代理连接..."
-          PROXY_IP=$(curl -x socks5://127.0.0.1:10808 -s --max-time 15 https://api.ipify.org || echo "获取失败")
-          echo "[INFO] 代理 IP: $PROXY_IP"
+          # 测试代理（隐藏 IP）
+          if curl -x socks5://127.0.0.1:10808 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+            echo "[INFO] ✅ 代理连接正常"
+          else
+            echo "[ERROR] ❌ 代理连接失败"
+            exit 1
+          fi
 
       - name: 执行续期
         env:
