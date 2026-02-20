@@ -4,7 +4,7 @@
 Panel NA1 自动重启脚本
 功能：
 1. 使用 Cookie 登录 https://panel.na1.host/
-2. 通过 API 获取服务器列表
+2. 从页面获取服务器列表
 3. 进入服务器页面点击 Restart 按钮
 4. 发送 Telegram 通知（带截图）
 5. 自动更新 Cookie 到 GitHub Secrets
@@ -13,7 +13,6 @@ Panel NA1 自动重启脚本
 import os
 import sys
 import json
-import time
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -27,7 +26,6 @@ except ImportError:
 
 # ==================== 配置 ====================
 BASE_URL = "https://panel.na1.host"
-API_URL = f"{BASE_URL}/api/client"
 OUTPUT_DIR = Path("output/screenshots")
 
 # ==================== 工具函数 ====================
@@ -63,9 +61,7 @@ def screenshot_path(name: str) -> str:
 
 
 def parse_cookie_string(cookie_str: str, domain: str) -> list:
-    """
-    解析 Cookie 字符串为 Playwright cookie 格式
-    """
+    """解析 Cookie 字符串为 Playwright cookie 格式"""
     if not cookie_str:
         return []
     
@@ -79,7 +75,6 @@ def parse_cookie_string(cookie_str: str, domain: str) -> list:
         name = item[:eq_index].strip()
         value = item[eq_index + 1:].strip()
         
-        # URL 解码
         try:
             value = unquote(value)
         except:
@@ -100,10 +95,7 @@ def parse_cookie_string(cookie_str: str, domain: str) -> list:
 
 
 def save_cookies_for_update(cookies: list) -> str:
-    """
-    保存重要 Cookie 用于后续更新
-    返回 Cookie 字符串
-    """
+    """保存重要 Cookie 用于后续更新"""
     important_prefixes = ["remember_web", "XSRF-TOKEN", "pterodactyl_session", "cf_clearance"]
     
     filtered = []
@@ -117,7 +109,6 @@ def save_cookies_for_update(cookies: list) -> str:
     
     cookie_string = "; ".join([f"{c['name']}={quote(c['value'], safe='')}" for c in filtered])
     
-    # 保存到文件
     cookie_file = OUTPUT_DIR / "new_cookies.txt"
     cookie_file.write_text(cookie_string)
     log("INFO", f"新 Cookie 已保存到 {cookie_file}")
@@ -126,10 +117,7 @@ def save_cookies_for_update(cookies: list) -> str:
 
 
 def update_github_secret(secret_name: str, secret_value: str) -> bool:
-    """
-    更新 GitHub Secret
-    需要 REPO_TOKEN 环境变量（具有 repo 权限的 PAT）
-    """
+    """更新 GitHub Secret"""
     repo_token = env_or_default("REPO_TOKEN")
     if not repo_token:
         log("WARN", "REPO_TOKEN 未设置，跳过 Secret 更新")
@@ -149,19 +137,16 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
             "X-GitHub-Api-Version": "2022-11-28"
         }
         
-        # 获取公钥
         pub_key_url = f"https://api.github.com/repos/{github_repo}/actions/secrets/public-key"
         resp = requests.get(pub_key_url, headers=headers, timeout=30)
         resp.raise_for_status()
         pub_key_data = resp.json()
         
-        # 加密 Secret
         public_key = public.PublicKey(pub_key_data["key"].encode("utf-8"), encoding.Base64Encoder())
         sealed_box = public.SealedBox(public_key)
         encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
         encrypted_value = encoding.Base64Encoder().encode(encrypted).decode("utf-8")
         
-        # 更新 Secret
         secret_url = f"https://api.github.com/repos/{github_repo}/actions/secrets/{secret_name}"
         resp = requests.put(
             secret_url,
@@ -174,7 +159,7 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         )
         resp.raise_for_status()
         
-        log("INFO", f"✅ GitHub Secret {secret_name} 已更新")
+        log("INFO", f"GitHub Secret {secret_name} 已更新")
         return True
         
     except ImportError:
@@ -186,9 +171,7 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
 
 
 def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = None):
-    """
-    发送 Telegram 通知（带截图）
-    """
+    """发送 Telegram 通知（带截图）"""
     bot_token = env_or_default("TG_BOT_TOKEN")
     chat_id = env_or_default("TG_CHAT_ID")
     
@@ -197,21 +180,20 @@ def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = 
         return
     
     try:
-        status = "✅ 成功" if ok else "❌ 失败"
+        status = "成功" if ok else "失败"
         text_lines = [
-            f"🤖 NA1 自动重启脚本",
+            f"NA1 自动重启脚本",
             f"",
-            f"📊 状态：{status}",
-            f"📍 阶段：{stage}",
+            f"状态: {status}",
+            f"阶段: {stage}",
         ]
         if msg:
-            text_lines.append(f"💬 信息：{msg}")
+            text_lines.append(f"信息: {msg}")
         text_lines.append(f"")
-        text_lines.append(f"⏰ 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        text_lines.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         caption = "\n".join(text_lines)
         
-        # 如果有截图，发送带图片的消息
         if screenshot_file and Path(screenshot_file).exists():
             photo_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
             with open(screenshot_file, "rb") as f:
@@ -219,21 +201,18 @@ def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = 
                     photo_url, 
                     data={
                         "chat_id": chat_id,
-                        "caption": caption,
-                        "parse_mode": "HTML"
+                        "caption": caption
                     }, 
                     files={"photo": f}, 
                     timeout=60
                 )
                 
                 if resp.status_code == 200:
-                    log("INFO", "✅ Telegram 通知已发送（带截图）")
+                    log("INFO", "Telegram 通知已发送（带截图）")
                 else:
                     log("WARN", f"Telegram 图片发送失败: {resp.text}")
-                    # 图片发送失败，尝试只发送文本
                     send_text_only(bot_token, chat_id, caption)
         else:
-            # 没有截图，只发送文本
             send_text_only(bot_token, chat_id, caption)
         
     except Exception as e:
@@ -251,54 +230,11 @@ def send_text_only(bot_token: str, chat_id: str, text: str):
         }, timeout=30)
         
         if resp.status_code == 200:
-            log("INFO", "✅ Telegram 文本通知已发送")
+            log("INFO", "Telegram 文本通知已发送")
         else:
             log("WARN", f"Telegram 消息发送失败: {resp.text}")
     except Exception as e:
         log("WARN", f"发送文本失败: {e}")
-
-
-def get_servers_from_api(cookies_str: str) -> list:
-    """
-    通过 API 获取服务器列表
-    返回服务器信息列表
-    """
-    try:
-        headers = {
-            "Accept": "application/json",
-            "Cookie": cookies_str,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        resp = requests.get(f"{API_URL}?page=1", headers=headers, timeout=30)
-        resp.raise_for_status()
-        
-        data = resp.json()
-        servers = []
-        
-        for item in data.get("data", []):
-            if item.get("object") == "server":
-                attrs = item.get("attributes", {})
-                server_id = attrs.get("identifier")
-                server_name = attrs.get("name", "unknown")
-                server_status = attrs.get("status")
-                is_suspended = attrs.get("is_suspended", False)
-                
-                if server_id:
-                    servers.append({
-                        "id": server_id,
-                        "name": server_name,
-                        "url": f"{BASE_URL}/server/{server_id}",
-                        "status": server_status,
-                        "is_suspended": is_suspended
-                    })
-                    log("INFO", f"📦 找到服务器: {server_name} (ID: {server_id})")
-        
-        return servers
-        
-    except Exception as e:
-        log("ERROR", f"API 获取服务器列表失败: {e}")
-        return []
 
 
 # ==================== 主逻辑 ====================
@@ -306,13 +242,11 @@ def get_servers_from_api(cookies_str: str) -> list:
 def main():
     """主函数"""
     log("INFO", "=" * 50)
-    log("INFO", "🚀 Panel NA1 自动重启脚本启动")
+    log("INFO", "Panel NA1 自动重启脚本启动")
     log("INFO", "=" * 50)
     
-    # 确保输出目录存在
     ensure_output_dir()
     
-    # 获取环境变量
     try:
         preset_cookies = env_or_throw("PANEL_NA1_COOKIES")
     except ValueError as e:
@@ -320,17 +254,7 @@ def main():
         notify_telegram(False, "初始化失败", "Cookie 环境变量未设置")
         sys.exit(1)
     
-    # 尝试通过 API 获取服务器列表
-    log("INFO", "📡 通过 API 获取服务器列表...")
-    servers = get_servers_from_api(preset_cookies)
-    
-    if servers:
-        log("INFO", f"✅ API 返回 {len(servers)} 个服务器")
-    else:
-        log("WARN", "⚠️ API 未返回服务器，将通过页面获取")
-    
-    # 启动浏览器
-    log("INFO", "🌐 启动浏览器...")
+    log("INFO", "启动浏览器...")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -352,39 +276,83 @@ def main():
         
         page = context.new_page()
         
-        # 注入反检测脚本
+        # 反检测
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
         """)
+        
+        # 用于存储拦截到的 API 数据
+        api_data = {"servers": []}
+        
+        # 拦截 API 请求
+        def handle_response(response):
+            if "/api/client" in response.url and response.status == 200:
+                try:
+                    data = response.json()
+                    for item in data.get("data", []):
+                        if item.get("object") == "server":
+                            attrs = item.get("attributes", {})
+                            server_id = attrs.get("identifier")
+                            server_name = attrs.get("name", "unknown")
+                            if server_id:
+                                api_data["servers"].append({
+                                    "id": server_id,
+                                    "name": server_name,
+                                    "url": f"{BASE_URL}/server/{server_id}"
+                                })
+                                log("INFO", f"API 获取到服务器: {server_name} (ID: {server_id})")
+                except Exception as e:
+                    log("WARN", f"解析 API 响应失败: {e}")
+        
+        page.on("response", handle_response)
         
         final_screenshot = None
         
         try:
             # 1. 注入 Cookie
-            log("INFO", "🍪 注入 Cookie...")
+            log("INFO", "注入 Cookie...")
             cookies = parse_cookie_string(preset_cookies, "panel.na1.host")
             if cookies:
                 context.add_cookies(cookies)
             
-            # 2. 访问首页
-            log("INFO", f"🔗 访问 {BASE_URL}...")
+            # 2. 访问首页（会自动触发 API 请求）
+            log("INFO", f"访问 {BASE_URL}...")
             page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)  # 等待 API 请求完成
             
             current_url = page.url
             title = page.title()
-            log("INFO", f"📍 当前 URL: {current_url}")
-            log("INFO", f"📄 页面标题: {title}")
+            log("INFO", f"当前 URL: {current_url}")
+            log("INFO", f"页面标题: {title}")
             
             # 3. 检查登录状态
             if "/auth/login" in current_url:
                 sp = screenshot_path("01-need-login")
                 page.screenshot(path=sp, full_page=True)
-                log("ERROR", "❌ Cookie 已失效，需要重新登录")
+                log("ERROR", "Cookie 已失效，需要重新登录")
                 notify_telegram(False, "登录检查", "Cookie 已失效，请更新 Cookie", sp)
                 sys.exit(1)
             
-            log("INFO", "✅ Cookie 有效，已登录")
+            log("INFO", "Cookie 有效，已登录")
+            
+            # 关闭可能的弹窗（如 What's new）
+            try:
+                dismiss_btn = page.locator('text=Dismiss').first
+                if dismiss_btn.is_visible():
+                    dismiss_btn.click()
+                    log("INFO", "关闭弹窗")
+                    page.wait_for_timeout(1000)
+            except:
+                pass
+            
+            try:
+                maybe_later = page.locator('text=Maybe later').first
+                if maybe_later.is_visible():
+                    maybe_later.click()
+                    log("INFO", "关闭反馈弹窗")
+                    page.wait_for_timeout(1000)
+            except:
+                pass
             
             # 4. 截图 Dashboard
             sp_dashboard = screenshot_path("02-dashboard")
@@ -395,35 +363,74 @@ def main():
             new_cookies = context.cookies()
             new_cookie_str = save_cookies_for_update(new_cookies)
             
-            # 6. 尝试更新 GitHub Secret
+            # 6. 更新 GitHub Secret
             if new_cookie_str:
                 update_github_secret("PANEL_NA1_COOKIES", new_cookie_str)
             
-            # 7. 获取服务器（如果 API 没获取到）
+            # 7. 获取服务器列表
+            servers = api_data["servers"]
+            
+            # 如果 API 没拦截到，从页面获取
             if not servers:
-                log("INFO", "🔍 从页面获取服务器链接...")
-                page.wait_for_timeout(2000)
-                server_links = page.locator('a[href^="/server/"]').all()
+                log("INFO", "从页面获取服务器链接...")
                 
-                for link in server_links[:5]:  # 最多处理5个
-                    href = link.get_attribute("href")
-                    if href:
-                        server_id = href.replace("/server/", "").split("/")[0]
-                        if server_id and server_id not in [s["id"] for s in servers]:
-                            servers.append({
-                                "id": server_id,
-                                "name": "unknown",
-                                "url": f"{BASE_URL}/server/{server_id}"
-                            })
+                # 尝试多种选择器
+                selectors = [
+                    'a[href*="/server/"]',
+                    '[data-server-id]',
+                    '.server-card a',
+                ]
+                
+                for selector in selectors:
+                    try:
+                        links = page.locator(selector).all()
+                        for link in links:
+                            href = link.get_attribute("href")
+                            if href and "/server/" in href:
+                                server_id = href.split("/server/")[-1].split("/")[0].split("?")[0]
+                                if server_id and len(server_id) > 5:
+                                    if server_id not in [s["id"] for s in servers]:
+                                        servers.append({
+                                            "id": server_id,
+                                            "name": server_id,
+                                            "url": f"{BASE_URL}/server/{server_id}"
+                                        })
+                                        log("INFO", f"页面获取到服务器: {server_id}")
+                    except:
+                        continue
+                
+                # 如果还是没找到，尝试点击服务器卡片区域
+                if not servers:
+                    log("INFO", "尝试查找服务器卡片...")
+                    try:
+                        # 根据截图，服务器卡片显示 DISK 信息
+                        cards = page.locator('div:has-text("DISK"):has-text("GiB")').all()
+                        for card in cards:
+                            try:
+                                # 尝试获取父元素的链接
+                                parent = card.locator('xpath=ancestor::a[contains(@href, "/server/")]').first
+                                href = parent.get_attribute("href")
+                                if href:
+                                    server_id = href.split("/server/")[-1].split("/")[0]
+                                    if server_id and server_id not in [s["id"] for s in servers]:
+                                        servers.append({
+                                            "id": server_id,
+                                            "name": server_id,
+                                            "url": f"{BASE_URL}/server/{server_id}"
+                                        })
+                            except:
+                                continue
+                    except:
+                        pass
             
             if not servers:
                 sp = screenshot_path("03-no-servers")
                 page.screenshot(path=sp, full_page=True)
-                log("ERROR", "❌ 未找到任何服务器")
+                log("ERROR", "未找到任何服务器")
                 notify_telegram(False, "获取服务器", "未找到任何服务器", sp)
                 sys.exit(1)
             
-            log("INFO", f"📋 共找到 {len(servers)} 个服务器")
+            log("INFO", f"共找到 {len(servers)} 个服务器")
             
             # 8. 遍历服务器执行重启
             success_count = 0
@@ -435,8 +442,8 @@ def main():
                 server_name = server.get("name", server_id)
                 server_url = server["url"]
                 
-                log("INFO", f"")
-                log("INFO", f"[{idx + 1}/{len(servers)}] 🖥️ 处理服务器: {server_name} ({server_id})")
+                log("INFO", "")
+                log("INFO", f"[{idx + 1}/{len(servers)}] 处理服务器: {server_name} ({server_id})")
                 
                 try:
                     # 进入服务器页面
@@ -450,38 +457,28 @@ def main():
                     restart_btn = None
                     btn_found = False
                     
-                    # 方法1: 通过文本查找
+                    # 方法1: 文本查找
                     try:
                         restart_btn = page.locator('button:has-text("Restart")').first
                         restart_btn.wait_for(state="visible", timeout=10000)
                         btn_found = True
-                        log("INFO", "✅ 通过文本找到 Restart 按钮")
+                        log("INFO", "找到 Restart 按钮")
                     except:
                         pass
                     
-                    # 方法2: 通过 class 查找
+                    # 方法2: class 查找
                     if not btn_found:
                         try:
-                            restart_btn = page.locator('button[class*="restartButton"]').first
+                            restart_btn = page.locator('button[class*="restart"]').first
                             restart_btn.wait_for(state="visible", timeout=5000)
                             btn_found = True
-                            log("INFO", "✅ 通过 class 找到 Restart 按钮")
-                        except:
-                            pass
-                    
-                    # 方法3: 通过 SVG 图标查找
-                    if not btn_found:
-                        try:
-                            restart_btn = page.locator('button:has(svg[viewBox="0 0 20 20"])').nth(1)
-                            restart_btn.wait_for(state="visible", timeout=5000)
-                            btn_found = True
-                            log("INFO", "✅ 通过 SVG 找到 Restart 按钮")
+                            log("INFO", "通过 class 找到 Restart 按钮")
                         except:
                             pass
                     
                     if not btn_found:
-                        log("WARN", f"⚠️ 未找到 Restart 按钮")
-                        results.append(f"❓ {server_name}: 未找到按钮")
+                        log("WARN", f"未找到 Restart 按钮")
+                        results.append(f"{server_name}: 未找到按钮")
                         fail_count += 1
                         continue
                     
@@ -489,13 +486,13 @@ def main():
                     is_disabled = restart_btn.is_disabled()
                     
                     if is_disabled:
-                        log("WARN", f"⚠️ Restart 按钮被禁用（服务器可能已停止）")
+                        log("WARN", f"Restart 按钮被禁用")
                         
-                        # 尝试点击 Start
+                        # 尝试 Start
                         try:
                             start_btn = page.locator('button:has-text("Start")').first
                             if not start_btn.is_disabled():
-                                log("INFO", "🔄 尝试点击 Start 按钮...")
+                                log("INFO", "点击 Start 按钮...")
                                 start_btn.click()
                                 page.wait_for_timeout(3000)
                                 
@@ -503,19 +500,19 @@ def main():
                                 page.screenshot(path=sp_started, full_page=True)
                                 final_screenshot = sp_started
                                 
-                                log("INFO", f"✅ 服务器 {server_name} 已启动")
-                                results.append(f"✅ {server_name}: 已启动")
+                                log("INFO", f"服务器 {server_name} 已启动")
+                                results.append(f"{server_name}: 已启动")
                                 success_count += 1
                                 continue
-                        except Exception as e:
-                            log("WARN", f"Start 按钮操作失败: {e}")
+                        except:
+                            pass
                         
-                        results.append(f"⚠️ {server_name}: 按钮禁用")
+                        results.append(f"{server_name}: 按钮禁用")
                         fail_count += 1
                         continue
                     
                     # 点击 Restart
-                    log("INFO", f"🔄 点击 Restart 按钮...")
+                    log("INFO", f"点击 Restart 按钮...")
                     restart_btn.click()
                     page.wait_for_timeout(5000)
                     
@@ -523,44 +520,30 @@ def main():
                     page.screenshot(path=sp_restarted, full_page=True)
                     final_screenshot = sp_restarted
                     
-                    log("INFO", f"✅ 服务器 {server_name} 重启成功")
-                    results.append(f"✅ {server_name}: 已重启")
+                    log("INFO", f"服务器 {server_name} 重启成功")
+                    results.append(f"{server_name}: 已重启")
                     success_count += 1
                     
                 except PlaywrightTimeout as e:
-                    log("ERROR", f"❌ 服务器 {server_id} 操作超时: {e}")
-                    results.append(f"❌ {server_name}: 超时")
+                    log("ERROR", f"服务器 {server_id} 操作超时")
+                    results.append(f"{server_name}: 超时")
                     fail_count += 1
-                    sp_error = screenshot_path(f"error-{server_id}")
-                    try:
-                        page.screenshot(path=sp_error, full_page=True)
-                        final_screenshot = sp_error
-                    except:
-                        pass
                     
                 except Exception as e:
-                    log("ERROR", f"❌ 服务器 {server_id} 操作失败: {e}")
-                    results.append(f"❌ {server_name}: {str(e)[:30]}")
+                    log("ERROR", f"服务器 {server_id} 操作失败: {e}")
+                    results.append(f"{server_name}: 失败")
                     fail_count += 1
-                    sp_error = screenshot_path(f"error-{server_id}")
-                    try:
-                        page.screenshot(path=sp_error, full_page=True)
-                        final_screenshot = sp_error
-                    except:
-                        pass
                 
-                # 避免请求过快
                 page.wait_for_timeout(2000)
             
             # 9. 最终报告
             log("INFO", "")
             log("INFO", "=" * 50)
             total = len(servers)
-            summary = f"成功: {success_count}/{total}, 失败: {fail_count}/{total}"
-            log("INFO", f"📊 执行完成 - {summary}")
+            summary = f"成功 {success_count}/{total}, 失败 {fail_count}/{total}"
+            log("INFO", f"执行完成 - {summary}")
             log("INFO", "=" * 50)
             
-            # 构建详细消息
             detail_msg = f"{summary}\n\n" + "\n".join(results)
             
             if fail_count == 0:
@@ -574,7 +557,7 @@ def main():
                 sys.exit(1)
             
         except Exception as e:
-            log("ERROR", f"💥 发生异常: {e}")
+            log("ERROR", f"发生异常: {e}")
             import traceback
             traceback.print_exc()
             
@@ -596,7 +579,7 @@ def main():
         finally:
             context.close()
             browser.close()
-            log("INFO", "🔒 浏览器已关闭")
+            log("INFO", "浏览器已关闭")
 
 
 if __name__ == "__main__":
