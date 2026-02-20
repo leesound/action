@@ -1,0 +1,56 @@
+name: Panel NA1 自动重启
+
+on:
+  # 手动触发
+  workflow_dispatch:
+
+jobs:
+  renew:
+    name: 自动重启服务器
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 安装依赖
+        run: |
+          pip install playwright requests pynacl
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: 创建截图输出目录
+        run: mkdir -p output/screenshots
+      
+      - name: 执行自动重启
+        env:
+          PANEL_NA1_COOKIES: ${{ secrets.PANEL_NA1_COOKIES }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/panel-na1_renew.py
+      
+      - name: 上传截图
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/
+          retention-days: 3
+      
+      - name: 清理旧运行记录
+        uses: Mattraks/delete-workflow-runs@v2
+        if: always()
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
