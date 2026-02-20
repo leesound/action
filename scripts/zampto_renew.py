@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zampto  自动续期脚本"""
+"""Zampto 自动续期脚本"""
 
 import os, sys, time, platform, requests, re
 from datetime import datetime, timezone, timedelta
