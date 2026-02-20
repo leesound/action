@@ -34,17 +34,13 @@ jobs:
             exit 0
           fi
           
-          # 下载 Xray
-          echo "[INFO] 下载 Xray..."
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray
           chmod +x xray/xray
           
-          # 判断协议类型
           PROTOCOL="${PROXY_NODE%%://*}"
-          echo "[INFO] 检测到协议: $PROTOCOL"
+          echo "[INFO] 协议: $PROTOCOL"
           
-          # 解析函数
           parse_params() {
             local params="$1"
             local key="$2"
@@ -53,7 +49,6 @@ jobs:
           
           case "$PROTOCOL" in
             vless)
-              # 解析 VLESS
               content="${PROXY_NODE#vless://}"
               content="${content%%#*}"
               uuid="${content%%@*}"
@@ -71,8 +66,6 @@ jobs:
               type_=$(parse_params "$params" "type")
               type_="${type_:-tcp}"
               
-              echo "[INFO] VLESS -> $server:$port (security: $security)"
-              
               if [ "$security" = "reality" ]; then
                 cat > xray/config.json << EOF
           {
@@ -84,10 +77,8 @@ jobs:
             }]
           }
           EOF
-              else
-                # 普通 VLESS (TLS 或无加密)
-                if [ "$security" = "tls" ]; then
-                  cat > xray/config.json << EOF
+              elif [ "$security" = "tls" ]; then
+                cat > xray/config.json << EOF
           {
             "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
             "outbounds": [{
@@ -97,8 +88,8 @@ jobs:
             }]
           }
           EOF
-                else
-                  cat > xray/config.json << EOF
+              else
+                cat > xray/config.json << EOF
           {
             "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
             "outbounds": [{
@@ -108,206 +99,28 @@ jobs:
             }]
           }
           EOF
-                fi
               fi
               ;;
-              
-            vmess)
-              # 解析 VMess (Base64 JSON)
-              content="${PROXY_NODE#vmess://}"
-              content="${content%%#*}"
-              json=$(echo "$content" | base64 -d 2>/dev/null)
-              
-              server=$(echo "$json" | grep -o '"add"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-              port=$(echo "$json" | grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*')
-              uuid=$(echo "$json" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-              aid=$(echo "$json" | grep -o '"aid"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*')
-              aid="${aid:-0}"
-              net=$(echo "$json" | grep -o '"net"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-              net="${net:-tcp}"
-              tls=$(echo "$json" | grep -o '"tls"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-              sni=$(echo "$json" | grep -o '"sni"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-              
-              echo "[INFO] VMess -> $server:$port (net: $net, tls: $tls)"
-              
-              if [ "$tls" = "tls" ]; then
-                cat > xray/config.json << EOF
-          {
-            "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
-            "outbounds": [{
-              "protocol": "vmess",
-              "settings": {"vnext": [{"address": "$server", "port": $port, "users": [{"id": "$uuid", "alterId": $aid, "security": "auto"}]}]},
-              "streamSettings": {"network": "$net", "security": "tls", "tlsSettings": {"serverName": "${sni:-$server}"}}
-            }]
-          }
-          EOF
-              else
-                cat > xray/config.json << EOF
-          {
-            "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
-            "outbounds": [{
-              "protocol": "vmess",
-              "settings": {"vnext": [{"address": "$server", "port": $port, "users": [{"id": "$uuid", "alterId": $aid, "security": "auto"}]}]},
-              "streamSettings": {"network": "$net", "security": "none"}
-            }]
-          }
-          EOF
-              fi
-              ;;
-              
-            ss|shadowsocks)
-              # 解析 Shadowsocks
-              content="${PROXY_NODE#*://}"
-              content="${content%%#*}"
-              
-              if [[ "$content" == *"@"* ]]; then
-                # 新格式: method:password@server:port
-                userinfo="${content%%@*}"
-                serverinfo="${content#*@}"
-                
-                # 可能是 base64 编码
-                if [[ "$userinfo" != *":"* ]]; then
-                  userinfo=$(echo "$userinfo" | base64 -d 2>/dev/null)
-                fi
-                
-                method="${userinfo%%:*}"
-                password="${userinfo#*:}"
-                server="${serverinfo%%:*}"
-                port="${serverinfo#*:}"
-                port="${port%%\?*}"
-              else
-                # 旧格式: base64(method:password)@server:port 或全 base64
-                decoded=$(echo "$content" | base64 -d 2>/dev/null)
-                if [[ "$decoded" == *"@"* ]]; then
-                  userinfo="${decoded%%@*}"
-                  serverinfo="${decoded#*@}"
-                  method="${userinfo%%:*}"
-                  password="${userinfo#*:}"
-                  server="${serverinfo%%:*}"
-                  port="${serverinfo#*:}"
-                else
-                  echo "[ERROR] 无法解析 SS 链接"
-                  exit 1
-                fi
-              fi
-              
-              echo "[INFO] Shadowsocks -> $server:$port (method: $method)"
-              
-              cat > xray/config.json << EOF
-          {
-            "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
-            "outbounds": [{
-              "protocol": "shadowsocks",
-              "settings": {"servers": [{"address": "$server", "port": $port, "method": "$method", "password": "$password"}]}
-            }]
-          }
-          EOF
-              ;;
-              
-            trojan)
-              # 解析 Trojan
-              content="${PROXY_NODE#trojan://}"
-              content="${content%%#*}"
-              password="${content%%@*}"
-              rest="${content#*@}"
-              server="${rest%%:*}"
-              port="${rest#*:}"
-              port="${port%%\?*}"
-              params="${rest#*\?}"
-              
-              sni=$(parse_params "$params" "sni")
-              sni="${sni:-$server}"
-              
-              echo "[INFO] Trojan -> $server:$port"
-              
-              cat > xray/config.json << EOF
-          {
-            "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
-            "outbounds": [{
-              "protocol": "trojan",
-              "settings": {"servers": [{"address": "$server", "port": $port, "password": "$password"}]},
-              "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"serverName": "$sni"}}
-            }]
-          }
-          EOF
-              ;;
-              
-            socks|socks5)
-              # 直接使用 SOCKS5 代理
-              content="${PROXY_NODE#*://}"
-              content="${content%%#*}"
-              
-              if [[ "$content" == *"@"* ]]; then
-                auth="${content%%@*}"
-                serverinfo="${content#*@}"
-                user="${auth%%:*}"
-                pass="${auth#*:}"
-              else
-                serverinfo="$content"
-                user=""
-                pass=""
-              fi
-              
-              server="${serverinfo%%:*}"
-              port="${serverinfo#*:}"
-              
-              echo "[INFO] SOCKS5 -> $server:$port"
-              
-              if [ -n "$user" ]; then
-                echo "PROXY_SOCKS5=socks5://$user:$pass@$server:$port" >> $GITHUB_ENV
-              else
-                echo "PROXY_SOCKS5=socks5://$server:$port" >> $GITHUB_ENV
-              fi
-              echo "[INFO] ✅ SOCKS5 代理配置完成"
-              exit 0
-              ;;
-              
-            http|https)
-              # HTTP 代理
-              content="${PROXY_NODE#*://}"
-              content="${content%%#*}"
-              echo "PROXY_HTTP=http://$content" >> $GITHUB_ENV
-              echo "[INFO] ✅ HTTP 代理配置完成"
-              exit 0
-              ;;
-              
             *)
               echo "[ERROR] 不支持的协议: $PROTOCOL"
               exit 1
               ;;
           esac
           
-          echo "[INFO] 配置文件:"
-          cat xray/config.json
-          
-          # 启动 Xray
-          echo "[INFO] 启动 Xray..."
-          cd xray && ./xray run -config config.json > xray.log 2>&1 &
-          XRAY_PID=$!
+          cd xray && ./xray run -config config.json > /dev/null 2>&1 &
           cd ..
           sleep 5
           
-          if ! kill -0 $XRAY_PID 2>/dev/null; then
-            echo "[ERROR] Xray 启动失败"
-            cat xray/xray.log
-            exit 1
-          fi
-          
-          # 测试代理
-          echo "[INFO] 测试代理连接..."
           for i in {1..5}; do
-            IP=$(curl -s --connect-timeout 10 --max-time 15 -x socks5://127.0.0.1:1080 https://api.ipify.org 2>/dev/null)
-            if [ -n "$IP" ]; then
-              echo "[INFO] ✅ 代理连接成功，IP: $IP"
+            if curl -s --connect-timeout 10 -x socks5://127.0.0.1:1080 https://api.ipify.org > /dev/null 2>&1; then
+              echo "[INFO] ✅ 代理连接成功"
               echo "PROXY_SOCKS5=socks5://127.0.0.1:1080" >> $GITHUB_ENV
               exit 0
             fi
-            echo "[WARN] 尝试 $i/5..."
             sleep 3
           done
           
           echo "[ERROR] ❌ 代理连接失败"
-          cat xray/xray.log
           exit 1
 
       - name: 运行续期脚本
