@@ -34,17 +34,32 @@ jobs:
             exit 0
           fi
           
+          # 下载 Xray
+          echo "[INFO] 下载 Xray..."
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray
           chmod +x xray/xray
           
+          # 判断协议类型
           PROTOCOL="${PROXY_NODE%%://*}"
-          echo "[INFO] 协议: $PROTOCOL"
+          echo "[INFO] 检测到协议: $PROTOCOL"
           
+          # 解析函数
           parse_params() {
             local params="$1"
             local key="$2"
             echo "$params" | tr '&' '\n' | grep "^${key}=" | cut -d'=' -f2
+          }
+          
+          # 隐藏敏感信息的函数
+          mask_string() {
+            local str="$1"
+            local len=${#str}
+            if [ $len -le 4 ]; then
+              echo "****"
+            else
+              echo "${str:0:2}***${str: -2}"
+            fi
           }
           
           case "$PROTOCOL" in
@@ -66,6 +81,9 @@ jobs:
               type_=$(parse_params "$params" "type")
               type_="${type_:-tcp}"
               
+              # 隐藏敏感信息输出
+              echo "[INFO] VLESS -> $(mask_string $server):$port (security: $security)"
+              
               if [ "$security" = "reality" ]; then
                 cat > xray/config.json << EOF
           {
@@ -77,8 +95,9 @@ jobs:
             }]
           }
           EOF
-              elif [ "$security" = "tls" ]; then
-                cat > xray/config.json << EOF
+              else
+                if [ "$security" = "tls" ]; then
+                  cat > xray/config.json << EOF
           {
             "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
             "outbounds": [{
@@ -88,8 +107,8 @@ jobs:
             }]
           }
           EOF
-              else
-                cat > xray/config.json << EOF
+                else
+                  cat > xray/config.json << EOF
           {
             "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
             "outbounds": [{
@@ -99,6 +118,7 @@ jobs:
             }]
           }
           EOF
+                fi
               fi
               ;;
               
@@ -116,6 +136,8 @@ jobs:
               net="${net:-tcp}"
               tls=$(echo "$json" | grep -o '"tls"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
               sni=$(echo "$json" | grep -o '"sni"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+              
+              echo "[INFO] VMess -> $(mask_string $server):$port (net: $net)"
               
               if [ "$tls" = "tls" ]; then
                 cat > xray/config.json << EOF
@@ -159,13 +181,20 @@ jobs:
                 port="${port%%\?*}"
               else
                 decoded=$(echo "$content" | base64 -d 2>/dev/null)
-                userinfo="${decoded%%@*}"
-                serverinfo="${decoded#*@}"
-                method="${userinfo%%:*}"
-                password="${userinfo#*:}"
-                server="${serverinfo%%:*}"
-                port="${serverinfo#*:}"
+                if [[ "$decoded" == *"@"* ]]; then
+                  userinfo="${decoded%%@*}"
+                  serverinfo="${decoded#*@}"
+                  method="${userinfo%%:*}"
+                  password="${userinfo#*:}"
+                  server="${serverinfo%%:*}"
+                  port="${serverinfo#*:}"
+                else
+                  echo "[ERROR] 无法解析 SS 链接"
+                  exit 1
+                fi
               fi
+              
+              echo "[INFO] Shadowsocks -> $(mask_string $server):$port"
               
               cat > xray/config.json << EOF
           {
@@ -190,6 +219,8 @@ jobs:
               sni=$(parse_params "$params" "sni")
               sni="${sni:-$server}"
               
+              echo "[INFO] Trojan -> $(mask_string $server):$port"
+              
               cat > xray/config.json << EOF
           {
             "inbounds": [{"port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
@@ -206,21 +237,20 @@ jobs:
               content="${PROXY_NODE#*://}"
               content="${content%%#*}"
               if [[ "$content" == *"@"* ]]; then
-                auth="${content%%@*}"
                 serverinfo="${content#*@}"
-                echo "PROXY_SOCKS5=socks5://$auth@$serverinfo" >> $GITHUB_ENV
               else
-                echo "PROXY_SOCKS5=socks5://$content" >> $GITHUB_ENV
+                serverinfo="$content"
               fi
-              echo "[INFO] ✅ SOCKS5 代理已配置"
+              server="${serverinfo%%:*}"
+              
+              echo "[INFO] SOCKS5 -> $(mask_string $server)"
+              echo "PROXY_SOCKS5=$PROXY_NODE" >> $GITHUB_ENV
               exit 0
               ;;
               
             http|https)
-              content="${PROXY_NODE#*://}"
-              content="${content%%#*}"
-              echo "PROXY_HTTP=http://$content" >> $GITHUB_ENV
-              echo "[INFO] ✅ HTTP 代理已配置"
+              echo "[INFO] HTTP 代理已配置"
+              echo "PROXY_HTTP=$PROXY_NODE" >> $GITHUB_ENV
               exit 0
               ;;
               
@@ -230,18 +260,30 @@ jobs:
               ;;
           esac
           
-          # 启动 Xray (不输出配置)
-          cd xray && ./xray run -config config.json > /dev/null 2>&1 &
+          echo "[INFO] 配置文件已生成"
+          
+          # 启动 Xray
+          echo "[INFO] 启动 Xray..."
+          cd xray && ./xray run -config config.json > xray.log 2>&1 &
+          XRAY_PID=$!
           cd ..
           sleep 5
           
+          if ! kill -0 $XRAY_PID 2>/dev/null; then
+            echo "[ERROR] Xray 启动失败"
+            cat xray/xray.log
+            exit 1
+          fi
+          
           # 测试代理
+          echo "[INFO] 测试代理连接..."
           for i in {1..5}; do
-            if curl -s --connect-timeout 10 -x socks5://127.0.0.1:1080 https://api.ipify.org > /dev/null 2>&1; then
+            if curl -s --connect-timeout 10 --max-time 15 -x socks5://127.0.0.1:1080 https://api.ipify.org > /dev/null 2>&1; then
               echo "[INFO] ✅ 代理连接成功"
               echo "PROXY_SOCKS5=socks5://127.0.0.1:1080" >> $GITHUB_ENV
               exit 0
             fi
+            echo "[WARN] 尝试 $i/5..."
             sleep 3
           done
           
