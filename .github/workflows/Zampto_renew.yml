@@ -1,0 +1,207 @@
+name: Zampto 自动续期
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install seleniumbase pyvirtualdisplay requests
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: 安装并启动代理
+        env:
+          PROXY_NODE: ${{ secrets.PROXY_NODE }}
+        run: |
+          # 检查是否配置了代理节点
+          if [ -z "$PROXY_NODE" ]; then
+            echo "[INFO] 未配置代理节点，将直连"
+            exit 0
+          fi
+          
+          # 下载 Xray
+          echo "[INFO] 下载 Xray..."
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip -d xray
+          chmod +x xray/xray
+          
+          # 解析 VLESS 链接
+          parse_vless() {
+            local url="$1"
+            # 移除前缀和备注
+            local content="${url#vless://}"
+            content="${content%%#*}"
+            
+            # 提取 UUID 和服务器信息
+            local uuid="${content%%@*}"
+            local rest="${content#*@}"
+            local server_port="${rest%%\?*}"
+            local server="${server_port%%:*}"
+            local port="${server_port##*:}"
+            local params="${rest#*\?}"
+            
+            # 解析参数
+            local sni="" pbk="" fp="" flow="" security="" type_="tcp"
+            
+            IFS='&' read -ra PARAMS <<< "$params"
+            for param in "${PARAMS[@]}"; do
+              key="${param%%=*}"
+              value="${param##*=}"
+              case "$key" in
+                sni) sni="$value" ;;
+                pbk) pbk="$value" ;;
+                fp) fp="$value" ;;
+                flow) flow="$value" ;;
+                security) security="$value" ;;
+                type) type_="$value" ;;
+              esac
+            done
+            
+            echo "$uuid|$server|$port|$sni|$pbk|$fp|$flow|$security|$type_"
+          }
+          
+          # 解析节点
+          parsed=$(parse_vless "$PROXY_NODE")
+          IFS='|' read -r uuid server port sni pbk fp flow security type_ <<< "$parsed"
+          
+          echo "[INFO] 服务器: $server:$port"
+          echo "[INFO] 协议: $security"
+          
+          # 生成配置文件
+          if [ "$security" = "reality" ]; then
+            # VLESS Reality 配置
+            cat > xray/config.json << EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+              "port": 1080,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
+              "settings": {"udp": true}
+            }],
+            "outbounds": [{
+              "protocol": "vless",
+              "settings": {
+                "vnext": [{
+                  "address": "$server",
+                  "port": $port,
+                  "users": [{
+                    "id": "$uuid",
+                    "encryption": "none",
+                    "flow": "$flow"
+                  }]
+                }]
+              },
+              "streamSettings": {
+                "network": "$type_",
+                "security": "reality",
+                "realitySettings": {
+                  "serverName": "$sni",
+                  "fingerprint": "$fp",
+                  "publicKey": "$pbk"
+                }
+              }
+            }]
+          }
+          EOF
+          else
+            # 普通 VLESS 配置
+            cat > xray/config.json << EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+              "port": 1080,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
+              "settings": {"udp": true}
+            }],
+            "outbounds": [{
+              "protocol": "vless",
+              "settings": {
+                "vnext": [{
+                  "address": "$server",
+                  "port": $port,
+                  "users": [{
+                    "id": "$uuid",
+                    "encryption": "none"
+                  }]
+                }]
+              },
+              "streamSettings": {
+                "network": "$type_",
+                "security": "none"
+              }
+            }]
+          }
+          EOF
+          fi
+          
+          echo "[INFO] 代理配置已生成"
+          cat xray/config.json
+          
+          # 启动 Xray
+          echo "[INFO] 启动 Xray..."
+          cd xray && ./xray run -config config.json > xray.log 2>&1 &
+          XRAY_PID=$!
+          cd ..
+          
+          # 等待启动
+          sleep 5
+          
+          # 检查进程
+          if ! kill -0 $XRAY_PID 2>/dev/null; then
+            echo "[ERROR] Xray 启动失败"
+            cat xray/xray.log
+            exit 1
+          fi
+          
+          # 测试代理连接
+          echo "[INFO] 测试代理连接..."
+          for i in {1..5}; do
+            if curl -s --connect-timeout 10 --max-time 15 -x socks5://127.0.0.1:1080 https://api.ipify.org; then
+              echo ""
+              echo "[INFO] ✅ 代理连接成功"
+              echo "PROXY_SOCKS5=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "[WARN] 尝试 $i/5 失败，等待重试..."
+            sleep 3
+          done
+          
+          echo "[ERROR] ❌ 代理连接失败"
+          cat xray/xray.log
+          exit 1
+
+      - name: 运行续期脚本
+        env:
+          ZAMPTO_ACCOUNT: ${{ secrets.ZAMPTO_ACCOUNT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_SOCKS5: ${{ env.PROXY_SOCKS5 }}
+        run: |
+          python scripts/zampto_renew.py
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
