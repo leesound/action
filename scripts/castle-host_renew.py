@@ -83,7 +83,7 @@ def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
 
 
 def mask_id(sid: str) -> str:
-    """掩码显示ID"""
+    """掩码显示ID（仅用于日志）"""
     return f"{sid[0]}***{sid[-2:]}" if len(sid) > 3 else sid
 
 
@@ -218,7 +218,7 @@ class CastleClient:
         try:
             path = screenshot_path(self.account_idx, server_id, stage)
             await self.page.screenshot(path=path, full_page=True)
-            logger.info(f"📸 截图已保存")  # 不显示路径
+            logger.info(f"📸 截图已保存")
             return path
         except Exception as e:
             logger.error(f"❌ 截图失败: {e}")
@@ -231,7 +231,7 @@ class CastleClient:
             if await csrf_meta.count() > 0:
                 token = await csrf_meta.get_attribute('content')
                 if token:
-                    logger.info(f"🔑 获取CSRF token成功")  # 不显示token内容
+                    logger.info(f"🔑 获取CSRF token成功")
                     return token
         except Exception as e:
             logger.error(f"❌ 获取CSRF token失败: {e}")
@@ -290,6 +290,7 @@ class CastleClient:
 
     async def get_expiry_and_prepare(self, sid: str) -> Tuple[str, Optional[str]]:
         """获取到期时间，并返回最新的 CSRF token"""
+        masked = mask_id(sid)
         try:
             await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
             await self.page.wait_for_timeout(1500)
@@ -340,7 +341,6 @@ class CastleClient:
             try:
                 data = await response.json()
             except:
-                text = await response.text()
                 logger.error(f"❌ 响应解析失败")
                 screenshot_file = await self.take_screenshot(sid, "error")
                 return RenewalStatus.FAILED, "响应解析失败", screenshot_file
@@ -350,17 +350,16 @@ class CastleClient:
             
             if data.get("status") == "error":
                 error_msg = data.get("error", "未知错误")
-                logger.info(f"📝 结果: {error_msg}")
                 status, msg = analyze_error(error_msg)
                 stage = "limited" if status == RenewalStatus.RATE_LIMITED else "failed"
+                logger.info(f"📝 结果: {msg}")
                 screenshot_file = await self.take_screenshot(sid, stage)
                 return status, msg, screenshot_file
             
             if data.get("status") == "success":
-                success_msg = data.get("success", "续约成功")
                 logger.info(f"📝 结果: ✅ 续约成功")
                 screenshot_file = await self.take_screenshot(sid, "success")
-                return RenewalStatus.SUCCESS, success_msg, screenshot_file
+                return RenewalStatus.SUCCESS, "续约成功", screenshot_file
             
             logger.info(f"📝 结果: 未知响应")
             screenshot_file = await self.take_screenshot(sid, "unknown")
@@ -407,7 +406,12 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                     logger.error(f"❌ 账号#{idx + 1} Cookie已失效")
                     error_screenshot = await client.take_screenshot("login", "expired")
                     await notifier.send_photo(
-                        f"❌ Castle-Host 账号#{idx + 1}\n\nCookie已失效，请更新\n\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"❌ Castle-Host 账号#{idx + 1}\n\n"
+                        f"Cookie已失效，请更新\n\n"
+                        f"📝 格式:\n"
+                        f"CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx\n"
+                        f"(多账号用,逗号分隔)\n\n"
+                        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                         error_screenshot
                     )
                 return None, []
@@ -431,7 +435,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                 results.append(ServerResult(sid, status, msg, expiry, d, started, screenshot))
                 await asyncio.sleep(2)
 
-            # 发送通知
+            # 发送通知（显示完整信息）
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
                     status_icon = "✅"
@@ -446,10 +450,10 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                 started_line = "🟢 服务器已启动\n" if r.started else ""
                 
                 caption = (
-                    f"🏰 Castle-Host 自动续约\n\n"
+                    f"🖥️ Castle-Host 自动续约\n\n"
                     f"状态: {status_icon} {status_text}\n"
                     f"账号: #{idx + 1}\n\n"
-                    f"💻 服务器: {mask_id(r.server_id)}\n"
+                    f"🖥️ 服务器: {r.server_id}\n"
                     f"📅 到期: {convert_date(r.expiry)}\n"
                     f"⏳ 剩余: {r.days} 天\n"
                     f"{started_line}\n"
@@ -468,7 +472,12 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
             logger.error(f"❌ 账号#{idx + 1} 异常: {e}")
             error_screenshot = await client.take_screenshot("error", "exception")
             await notifier.send_photo(
-                f"❌ Castle-Host 账号#{idx + 1}\n\n异常: {e}\n\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"❌ Castle-Host 账号#{idx + 1}\n\n"
+                f"异常: {e}\n\n"
+                f"📝 Cookie格式:\n"
+                f"CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx\n"
+                f"(多账号用,逗号分隔)\n\n"
+                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 error_screenshot
             )
             return None, []
@@ -479,7 +488,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
 
 async def main():
     logger.info("=" * 50)
-    logger.info("🏰 Castle-Host 自动续约")
+    logger.info("🖥️ Castle-Host 自动续约")
     logger.info("=" * 50)
 
     ensure_output_dir()
