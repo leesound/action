@@ -10,6 +10,8 @@ Panel Bytte 自动重启&续约脚本
 4. 进入设置页面检查是否需要续约
 5. 发送 Telegram 通知（带截图）
 6. 自动更新 Cookie 到 GitHub Secrets
+配置变量:
+- PANEL_BYTTE_COOKIES=remember_web_59baxxx=eyJpxxx
 """
 
 import os
