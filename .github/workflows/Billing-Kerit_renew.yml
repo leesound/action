@@ -1,0 +1,75 @@
+name: Billing Kerit 自动续订
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  
+  # 定时触发 - 每天 UTC 时间 0:00 和 12:00 执行（北京时间 8:00 和 20:00）
+#  schedule:
+#    - cron: '0 0,12 * * *'
+
+jobs:
+  renew:
+    name: 自动续订服务器
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool x11-utils fluxbox
+      
+      - name: 安装 Python 依赖
+        run: |
+          pip install seleniumbase aiohttp pynacl
+          seleniumbase install chromedriver
+      
+      - name: 创建截图输出目录
+        run: mkdir -p output/screenshots
+      
+      - name: 启动虚拟显示
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          fluxbox &
+          sleep 1
+      
+      - name: 执行自动续订
+        env:
+          DISPLAY: ":99"
+          BILLING_KERIT_COOKIES: ${{ secrets.BILLING_KERIT_COOKIES }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          export DISPLAY=:99
+          python scripts/Billing-Kerit_renew.py
+      
+      - name: 上传截图
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/
+          retention-days: 3
+      
+      - name: 清理旧运行记录
+        uses: Mattraks/delete-workflow-runs@v2
+        if: always()
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: "Billing Kerit 自动续订"
+          retain_days: 0
+          keep_minimum_runs: 3
