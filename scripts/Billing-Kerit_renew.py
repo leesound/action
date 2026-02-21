@@ -228,6 +228,7 @@ def save_cookies_for_update(sb) -> Optional[str]:
         log("ERROR", f"保存 Cookie 失败: {e}")
         return None
 
+
 def setup_network_interception(sb):
     """设置网络拦截，捕获 /api/renew 响应"""
     sb.execute_script("""
@@ -510,19 +511,25 @@ def check_login_status(sb) -> bool:
 
 
 def check_access_blocked(sb) -> bool:
-    """检查是否被阻止访问"""
+    """检查是否被阻止访问（包括 VPN/代理/数据中心 IP 限制）"""
     try:
         blocked = sb.execute_script("""
             var bodyText = (document.body.innerText || '').toLowerCase();
             return bodyText.includes('access denied') ||
+                   bodyText.includes('access restricted') ||
                    bodyText.includes('blocked') ||
                    bodyText.includes('forbidden') ||
                    bodyText.includes('rate limit') ||
-                   bodyText.includes('too many requests');
+                   bodyText.includes('too many requests') ||
+                   bodyText.includes('restrict access from vpns') ||
+                   bodyText.includes('datacenter ips') ||
+                   bodyText.includes('unusual network activity') ||
+                   bodyText.includes('disable your vpn');
         """)
         return blocked
     except:
         return False
+
 
 def main():
     """主函数"""
@@ -607,6 +614,14 @@ def main():
                         except:
                             pass
                 
+                # 首次访问后检查 IP 是否被阻止
+                if check_access_blocked(sb):
+                    sp_blocked = screenshot_path("00-ip-blocked")
+                    sb.save_screenshot(sp_blocked)
+                    log("ERROR", "❌ 访问被阻止，IP 被限制")
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请更换代理", sp_blocked)
+                    sys.exit(1)
+                
                 # 2. 注入 session_id Cookie
                 if session_cookie:
                     log("INFO", "🍪 注入 session_id Cookie...")
@@ -666,7 +681,7 @@ def main():
                     sp_blocked = screenshot_path("02-blocked")
                     sb.save_screenshot(sp_blocked)
                     log("ERROR", "❌ 访问被阻止")
-                    notify_telegram(False, "访问被阻止", "IP 可能被限制", sp_blocked)
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请更换代理", sp_blocked)
                     sys.exit(1)
                 
                 sp_free = screenshot_path("02-free-plans")
