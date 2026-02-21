@@ -54,7 +54,7 @@ def env_or_default(name: str, default: str = "") -> str:
 def ensure_output_dir():
     """确保输出目录存在"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    log("INFO", f"输出目录: {OUTPUT_DIR.absolute()}")
+    log("INFO", f"输出目录已就绪")
 
 
 def screenshot_path(name: str) -> str:
@@ -95,9 +95,9 @@ def parse_cookie_string(cookie_str: str, domain: str) -> list:
             "sameSite": "Lax"
         })
     
-    log("INFO", f"解析到 {len(cookies)} 个 Cookie")
-    for c in cookies:
-        log("INFO", f"  - {c['name']}: {c['value'][:20]}...")
+    # 只显示 Cookie 名称，隐藏值
+    cookie_names = [c["name"] for c in cookies]
+    log("INFO", f"解析到 {len(cookies)} 个 Cookie: {', '.join(cookie_names)}")
     return cookies
 
 
@@ -224,7 +224,7 @@ def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = 
                 if resp.status_code == 200:
                     log("INFO", "Telegram 通知已发送（带截图）")
                 else:
-                    log("WARN", f"Telegram 图片发送失败: {resp.text}")
+                    log("WARN", f"Telegram 图片发送失败")
                     send_text_only(bot_token, chat_id, caption)
         else:
             send_text_only(bot_token, chat_id, caption)
@@ -246,7 +246,7 @@ def send_text_only(bot_token: str, chat_id: str, text: str):
         if resp.status_code == 200:
             log("INFO", "Telegram 文本通知已发送")
         else:
-            log("WARN", f"Telegram 消息发送失败: {resp.text}")
+            log("WARN", f"Telegram 消息发送失败")
     except Exception as e:
         log("WARN", f"发送文本失败: {e}")
 
