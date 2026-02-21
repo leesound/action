@@ -96,34 +96,31 @@ def parse_cookie_string(cookie_str: str, domain: str) -> list:
         })
     
     log("INFO", f"解析到 {len(cookies)} 个 Cookie")
+    for c in cookies:
+        log("INFO", f"  - {c['name']}: {c['value'][:20]}...")
     return cookies
 
 
 def save_cookies_for_update(cookies: list) -> str:
     """保存重要 Cookie 用于后续更新"""
-    # 保留所有重要的 Cookie
+    # 只保留关键 Cookie
     important_names = ["session_id", "cf_clearance"]
-    important_prefixes = ["ph_"]
     
     filtered = []
     for c in cookies:
         name = c.get("name", "")
-        # 保留指定名称或前缀的 Cookie
-        if name in important_names or any(name.startswith(p) for p in important_prefixes):
+        if name in important_names:
             filtered.append(c)
     
     if not filtered:
-        # 如果没有匹配的，保留所有 Cookie
-        filtered = cookies
-    
-    if not filtered:
+        log("WARN", "未找到关键 Cookie")
         return ""
     
     cookie_string = "; ".join([f"{c['name']}={quote(str(c.get('value', '')), safe='')}" for c in filtered])
     
     cookie_file = OUTPUT_DIR / "new_cookies.txt"
     cookie_file.write_text(cookie_string)
-    log("INFO", f"新 Cookie 已保存")
+    log("INFO", f"新 Cookie 已保存 ({len(filtered)} 个)")
     
     return cookie_string
 
@@ -323,7 +320,7 @@ def main():
             page.screenshot(path=sp_home, full_page=True)
             final_screenshot = sp_home
             
-            # 3. 检查登录状态 - 检查是否有登录相关元素
+            # 3. 检查登录状态
             if "/login" in current_url or "/auth" in current_url:
                 log("ERROR", "❌ Cookie 已失效，需要重新登录")
                 notify_telegram(False, "登录检查", "Cookie 已失效，请更新 Cookie", sp_home)
@@ -331,12 +328,10 @@ def main():
             
             # 检查页面是否有用户信息（登录成功的标志）
             try:
-                # 检查是否有 logout 按钮或用户名显示
                 user_element = page.locator('button:has-text("Logout")').first
                 user_element.wait_for(state="visible", timeout=5000)
                 log("INFO", "✅ Cookie 有效，已登录")
             except:
-                # 尝试其他方式确认登录
                 try:
                     sidebar = page.locator('.sidebar').first
                     sidebar.wait_for(state="visible", timeout=5000)
@@ -346,8 +341,6 @@ def main():
             
             # 4. 进入 Free Plans 页面
             log("INFO", "🎁 进入 Free Plans 页面...")
-            
-            # 方法1: 直接访问 URL
             page.goto(FREE_PANEL_URL, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(3000)
             
