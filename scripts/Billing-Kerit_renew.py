@@ -2,13 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Billing Kerit 自动续订脚本
-功能：
-1. 启动浏览器，注入 Cookie
-2. 访问首页，进入续订页面
-3. 检查续订按钮，处理 Turnstile 验证
-4. 点击广告并完成续订
-5. 发送 Telegram 通知（包含截图）
-6. 自动更新 Cookie 到 GitHub Secrets
+支持代理模式绕过 IP 限制
 """
 
 import os
@@ -19,15 +13,18 @@ import subprocess
 import asyncio
 import aiohttp
 import base64
-from datetime import datetime
+import platform
+import requests
+from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote, quote
+from pathlib import Path
 
 try:
     from seleniumbase import SB
     SELENIUMBASE_AVAILABLE = True
 except ImportError:
     SELENIUMBASE_AVAILABLE = False
-    print("[ERROR] seleniumbase 未安装，请运行: pip install seleniumbase")
+    print("[ERROR] seleniumbase 未安装")
 
 try:
     from nacl import encoding, public
@@ -35,23 +32,39 @@ try:
 except ImportError:
     NACL_AVAILABLE = False
 
+try:
+    from pyvirtualdisplay import Display
+    PYVIRTUALDISPLAY_AVAILABLE = True
+except ImportError:
+    PYVIRTUALDISPLAY_AVAILABLE = False
+
 # ==================== 配置 ====================
 BASE_URL = "https://billing.kerit.cloud"
 SESSION_URL = f"{BASE_URL}/session"
 FREE_PANEL_URL = f"{BASE_URL}/free_panel"
 DOMAIN = "billing.kerit.cloud"
-OUTPUT_DIR = "output/screenshots"
+OUTPUT_DIR = Path("output/screenshots")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CN_TZ = timezone(timedelta(hours=8))
+
 
 # ==================== 工具函数 ====================
 
+def cn_now() -> datetime:
+    return datetime.now(CN_TZ)
+
+
+def cn_time_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return cn_now().strftime(fmt)
+
+
 def log(level: str, msg: str):
-    """统一日志格式"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = cn_time_str()
     print(f"[{timestamp}] [{level}] {msg}")
 
 
 def env_or_throw(name: str) -> str:
-    """获取环境变量，不存在则抛出异常"""
     value = os.environ.get(name)
     if not value:
         raise ValueError(f"环境变量 {name} 未设置")
@@ -59,24 +72,41 @@ def env_or_throw(name: str) -> str:
 
 
 def env_or_default(name: str, default: str = "") -> str:
-    """获取环境变量，不存在则返回默认值"""
     return os.environ.get(name, default)
 
 
-def ensure_output_dir():
-    """确保输出目录存在"""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    log("INFO", "输出目录已就绪")
-
-
 def screenshot_path(name: str) -> str:
-    """生成截图路径"""
-    return f"{OUTPUT_DIR}/{name}.png"
+    return str(OUTPUT_DIR / f"{name}.png")
 
 
-def random_delay(min_sec=0.5, max_sec=2.0):
-    """随机延迟"""
-    time.sleep(random.uniform(min_sec, max_sec))
+def mask(s: str, show: int = 2) -> str:
+    if not s:
+        return "***"
+    s = str(s)
+    if len(s) <= show * 2:
+        return s[:show] + "***"
+    return s[:show] + "***" + s[-show:]
+
+
+def is_linux():
+    return platform.system().lower() == "linux"
+
+
+def setup_display():
+    """设置虚拟显示"""
+    if is_linux() and not os.environ.get("DISPLAY"):
+        if PYVIRTUALDISPLAY_AVAILABLE:
+            try:
+                d = Display(visible=False, size=(1920, 1080))
+                d.start()
+                os.environ["DISPLAY"] = d.new_display_var
+                log("INFO", "虚拟显示已启动")
+                return d
+            except Exception as e:
+                log("ERROR", f"虚拟显示失败: {e}")
+        else:
+            log("WARN", "pyvirtualdisplay 未安装")
+    return None
 
 
 def parse_cookie_string(cookie_str: str):
@@ -106,14 +136,27 @@ def parse_cookie_string(cookie_str: str):
     return cookies
 
 
+def test_proxy(proxy_url: str) -> bool:
+    """测试代理连接"""
+    if not proxy_url:
+        return False
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url}
+        resp = requests.get("https://api.ipify.org", proxies=proxies, timeout=10)
+        log("INFO", f"代理 IP: {resp.text}")
+        return True
+    except Exception as e:
+        log("WARN", f"代理测试失败: {e}")
+        return False
+
+
 # ==================== Telegram 通知 ====================
 
 async def tg_notify(message):
-    """发送 Telegram 文本通知"""
     token = env_or_default("TG_BOT_TOKEN")
     chat_id = env_or_default("TG_CHAT_ID")
     if not token or not chat_id:
-        log("WARN", "Telegram 配置不完整，跳过通知")
+        log("WARN", "Telegram 配置不完整")
         return
     async with aiohttp.ClientSession() as session:
         try:
@@ -121,27 +164,26 @@ async def tg_notify(message):
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
             )
-            log("INFO", "Telegram 文本通知已发送")
+            log("INFO", "Telegram 通知已发送")
         except Exception as e:
             log("WARN", f"Telegram 发送失败: {e}")
 
 
 async def tg_notify_photo(photo_path, caption=""):
-    """发送 Telegram 图片通知"""
     token = env_or_default("TG_BOT_TOKEN")
     chat_id = env_or_default("TG_CHAT_ID")
-    if not token or not chat_id or not os.path.exists(photo_path):
+    if not token or not chat_id or not Path(photo_path).exists():
         return
     async with aiohttp.ClientSession() as session:
         try:
             with open(photo_path, "rb") as f:
                 data = aiohttp.FormData()
                 data.add_field("chat_id", chat_id)
-                data.add_field("photo", f, filename=os.path.basename(photo_path))
+                data.add_field("photo", f, filename=Path(photo_path).name)
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
                 await session.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data)
-            log("INFO", "Telegram 图片通知已发送")
+            log("INFO", "Telegram 图片已发送")
         except Exception as e:
             log("WARN", f"Telegram 图片发送失败: {e}")
 
@@ -155,7 +197,6 @@ def sync_tg_notify_photo(photo_path, caption=""):
 
 
 def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = None):
-    """发送 Telegram 通知"""
     status = "✅ 成功" if ok else "❌ 失败"
     text_lines = [
         f"📋 <b>Billing Kerit 自动续订</b>",
@@ -167,11 +208,11 @@ def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = 
         text_lines.append(f"")
         text_lines.append(msg)
     text_lines.append(f"")
-    text_lines.append(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    text_lines.append(f"⏰ {cn_time_str()}")
     
     caption = "\n".join(text_lines)
     
-    if screenshot_file and os.path.exists(screenshot_file):
+    if screenshot_file and Path(screenshot_file).exists():
         sync_tg_notify_photo(screenshot_file, caption)
     else:
         sync_tg_notify(caption)
@@ -180,7 +221,6 @@ def notify_telegram(ok: bool, stage: str, msg: str = "", screenshot_file: str = 
 # ==================== GitHub Secret 更新 ====================
 
 def encrypt_secret(public_key, secret_value):
-    """加密 Secret 值"""
     pk = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
     sealed_box = public.SealedBox(pk)
     encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
@@ -188,7 +228,6 @@ def encrypt_secret(public_key, secret_value):
 
 
 async def update_github_secret_async(secret_name, secret_value):
-    """异步更新 GitHub Secret"""
     repo_token = env_or_default("REPO_TOKEN")
     repository = env_or_default("GITHUB_REPOSITORY")
     
@@ -223,7 +262,6 @@ async def update_github_secret_async(secret_name, secret_value):
 
 
 def update_github_secret(secret_name: str, secret_value: str) -> bool:
-    """更新 GitHub Secret"""
     result = asyncio.run(update_github_secret_async(secret_name, secret_value))
     if result:
         log("INFO", "GitHub Secret 已更新")
@@ -231,7 +269,6 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
 
 
 def save_cookies_for_update(sb) -> str:
-    """从浏览器保存 Cookie"""
     try:
         cookies = sb.get_cookies()
         important_names = ["session_id", "cf_clearance"]
@@ -248,7 +285,7 @@ def save_cookies_for_update(sb) -> str:
         
         cookie_string = "; ".join([f"{c['name']}={quote(str(c.get('value', '')), safe='')}" for c in filtered])
         
-        cookie_file = f"{OUTPUT_DIR}/new_cookies.txt"
+        cookie_file = OUTPUT_DIR / "new_cookies.txt"
         with open(cookie_file, "w") as f:
             f.write(cookie_string)
         log("INFO", f"新 Cookie 已保存 ({len(filtered)} 个)")
@@ -294,7 +331,6 @@ EXPAND_POPUP_JS = """
 
 
 def check_turnstile_exists(sb):
-    """检查 Turnstile 是否存在"""
     try:
         return sb.execute_script("""
             return document.querySelector('input[name="cf-turnstile-response"]') !== null;
@@ -304,7 +340,6 @@ def check_turnstile_exists(sb):
 
 
 def check_turnstile_solved(sb):
-    """检查 Turnstile 是否已通过"""
     try:
         return sb.execute_script("""
             var input = document.querySelector('input[name="cf-turnstile-response"]');
@@ -315,7 +350,6 @@ def check_turnstile_solved(sb):
 
 
 def get_turnstile_checkbox_coords(sb):
-    """获取 Turnstile 复选框坐标"""
     try:
         coords = sb.execute_script("""
             var iframes = document.querySelectorAll('iframe');
@@ -325,26 +359,21 @@ def get_turnstile_checkbox_coords(sb):
                     var rect = iframes[i].getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
                         return {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
+                            x: rect.x, y: rect.y,
+                            width: rect.width, height: rect.height,
                             click_x: Math.round(rect.x + 30),
                             click_y: Math.round(rect.y + rect.height / 2)
                         };
                     }
                 }
             }
-            
-            var turnstileContainer = document.getElementById('turnstile-container');
-            if (turnstileContainer) {
-                var rect = turnstileContainer.getBoundingClientRect();
+            var container = document.getElementById('turnstile-container');
+            if (container) {
+                var rect = container.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0) {
                     return {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height,
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height,
                         click_x: Math.round(rect.x + 30),
                         click_y: Math.round(rect.y + rect.height / 2)
                     };
@@ -358,7 +387,6 @@ def get_turnstile_checkbox_coords(sb):
 
 
 def activate_browser_window():
-    """激活浏览器窗口"""
     try:
         result = subprocess.run(
             ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
@@ -378,7 +406,6 @@ def activate_browser_window():
 
 
 def xdotool_click(x, y):
-    """使用 xdotool 点击"""
     x, y = int(x), int(y)
     activate_browser_window()
     try:
@@ -396,7 +423,6 @@ def xdotool_click(x, y):
 
 
 def click_turnstile_checkbox(sb):
-    """点击 Turnstile 复选框"""
     coords = get_turnstile_checkbox_coords(sb)
     if not coords:
         log("WARN", "无法获取 Turnstile 坐标")
@@ -424,10 +450,8 @@ def click_turnstile_checkbox(sb):
 
 
 def handle_turnstile(sb, max_attempts=6):
-    """处理 Turnstile 验证"""
     log("INFO", "开始处理 Turnstile 验证...")
     
-    # 等待 Turnstile 出现
     for _ in range(10):
         if check_turnstile_exists(sb):
             log("INFO", "检测到 Turnstile")
@@ -437,12 +461,10 @@ def handle_turnstile(sb, max_attempts=6):
         log("WARN", "未检测到 Turnstile")
         return False
     
-    # 展开弹窗样式
     for _ in range(3):
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.5)
     
-    # 尝试点击并等待验证
     for attempt in range(max_attempts):
         log("INFO", f"Turnstile 尝试 {attempt + 1}/{max_attempts}")
         
@@ -454,7 +476,6 @@ def handle_turnstile(sb, max_attempts=6):
         time.sleep(0.3)
         click_turnstile_checkbox(sb)
         
-        # 等待验证结果
         for _ in range(10):
             time.sleep(0.5)
             if check_turnstile_solved(sb):
@@ -465,7 +486,6 @@ def handle_turnstile(sb, max_attempts=6):
 
 
 def check_renew_button_enabled(sb):
-    """检查 Complete Renewal 按钮是否可用"""
     try:
         return sb.execute_script("""
             var btn = document.getElementById('renewBtn');
@@ -477,7 +497,6 @@ def check_renew_button_enabled(sb):
 
 
 def check_renewal_result(sb):
-    """检查续订结果"""
     try:
         page_text = sb.get_page_source()
         if "success" in page_text.lower() or "renewed" in page_text.lower():
@@ -489,10 +508,33 @@ def check_renewal_result(sb):
         return None
 
 
+def check_access_blocked(sb) -> bool:
+    """检查是否被 IP 限制"""
+    try:
+        page_source = sb.get_page_source()
+        blocked_keywords = [
+            "Access Restricted",
+            "Access Blocked",
+            "unusual network activity",
+            "VPN or Proxy Detected",
+            "datacenter IPs"
+        ]
+        for keyword in blocked_keywords:
+            if keyword in page_source:
+                return True
+        
+        current_url = sb.get_current_url()
+        if "/error" in current_url:
+            return True
+        
+        return False
+    except:
+        return False
+
+
 # ==================== 主逻辑 ====================
 
 def main():
-    """主函数"""
     log("INFO", "=" * 50)
     log("INFO", "🚀 Billing Kerit 自动续订脚本启动")
     log("INFO", "=" * 50)
@@ -501,9 +543,19 @@ def main():
         notify_telegram(False, "初始化失败", "seleniumbase 未安装")
         sys.exit(1)
     
-    ensure_output_dir()
+    # 检查代理配置
+    proxy_socks5 = env_or_default("PROXY_SOCKS5")
+    proxy_http = env_or_default("PROXY_HTTP")
     
-    # 获取 Cookie
+    if proxy_socks5:
+        log("INFO", f"🌐 使用代理: {mask(proxy_socks5)}")
+        if test_proxy(proxy_socks5):
+            log("INFO", "✅ 代理连接正常")
+        else:
+            log("WARN", "⚠️ 代理测试失败，继续尝试...")
+    else:
+        log("INFO", "⚠️ 未配置代理，直连模式（可能被 IP 限制）")
+    
     try:
         preset_cookies = env_or_throw("BILLING_KERIT_COOKIES")
     except ValueError as e:
@@ -517,6 +569,9 @@ def main():
         notify_telegram(False, "初始化失败", "Cookie 解析失败")
         sys.exit(1)
     
+    # 设置虚拟显示
+    display = setup_display()
+    
     final_screenshot = None
     renewal_count = "未知"
     status_text = "未知"
@@ -524,20 +579,36 @@ def main():
     log("INFO", "🌐 启动浏览器...")
     
     try:
-        with SB(
-            uc=True,
-            test=True,
-            locale="en",
-            headless=False,
-            chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--disable-software-rasterizer,--disable-background-timer-throttling"
-        ) as sb:
+        # 构建浏览器选项
+        sb_options = {
+            "uc": True,
+            "test": True,
+            "locale": "en",
+            "headed": not is_linux(),
+            "chromium_arg": "--disable-dev-shm-usage,--no-sandbox,--disable-gpu"
+        }
+        
+        # 添加代理
+        if proxy_socks5:
+            sb_options["proxy"] = proxy_socks5
+            log("INFO", "浏览器将使用代理")
+        
+        with SB(**sb_options) as sb:
             log("INFO", "浏览器已启动")
             
             try:
                 # 1. 设置 Cookie
                 log("INFO", "🍪 注入 Cookie...")
-                sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
-                time.sleep(2)
+                sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=5)
+                time.sleep(3)
+                
+                # 检查是否被阻止
+                if check_access_blocked(sb):
+                    sp_blocked = screenshot_path("00-access-blocked")
+                    sb.save_screenshot(sp_blocked)
+                    log("ERROR", "❌ 访问被阻止 - IP 被限制")
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    sys.exit(1)
                 
                 for c in cookies:
                     sb.add_cookie({
@@ -556,7 +627,14 @@ def main():
                 current_url = sb.get_current_url()
                 log("INFO", f"当前 URL: {current_url}")
                 
-                # 截图首页
+                # 再次检查是否被阻止
+                if check_access_blocked(sb):
+                    sp_blocked = screenshot_path("01-access-blocked")
+                    sb.save_screenshot(sp_blocked)
+                    log("ERROR", "❌ 访问被阻止 - IP 被限制")
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    sys.exit(1)
+                
                 sp_home = screenshot_path("01-homepage")
                 sb.save_screenshot(sp_home)
                 final_screenshot = sp_home
@@ -574,7 +652,14 @@ def main():
                 sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=5)
                 time.sleep(3)
                 
-                # 截图 Free Plans 页面
+                # 检查是否被阻止
+                if check_access_blocked(sb):
+                    sp_blocked = screenshot_path("02-access-blocked")
+                    sb.save_screenshot(sp_blocked)
+                    log("ERROR", "❌ 访问被阻止 - IP 被限制")
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    sys.exit(1)
+                
                 sp_free = screenshot_path("02-free-plans")
                 sb.save_screenshot(sp_free)
                 final_screenshot = sp_free
@@ -615,7 +700,6 @@ def main():
                     log("INFO", "⏭️ 续订按钮已禁用，跳过续订")
                     result_message = f"续订次数: {renewal_count}/7\n状态: {status_text}\n\n⏭️ 已达到续订限制或未到续订时间"
                     
-                    # 保存并更新 Cookie
                     new_cookie_str = save_cookies_for_update(sb)
                     if new_cookie_str:
                         update_github_secret("BILLING_KERIT_COOKIES", new_cookie_str)
@@ -625,7 +709,6 @@ def main():
                     # 7. 开始续订流程
                     log("INFO", "✨ 续订按钮可用，开始续订流程...")
                     
-                    # 点击续订按钮
                     sb.execute_script("""
                         var btn = document.getElementById('renewServerBtn');
                         if (btn) btn.click();
@@ -633,12 +716,10 @@ def main():
                     log("INFO", "已点击续订按钮，等待模态框...")
                     time.sleep(2)
                     
-                    # 截图模态框
                     sp_modal = screenshot_path("03-renewal-modal")
                     sb.save_screenshot(sp_modal)
                     final_screenshot = sp_modal
                     
-                    # 检查模态框是否打开
                     modal_visible = sb.execute_script("""
                         var modal = document.getElementById('renewalModal');
                         if (!modal) return false;
@@ -653,6 +734,14 @@ def main():
                     
                     # 8. 处理 Turnstile 验证
                     log("INFO", "⏳ 处理 Turnstile 验证...")
+                    
+                    # 尝试 SeleniumBase 内置方法
+                    try:
+                        sb.uc_gui_click_captcha()
+                        time.sleep(3)
+                    except Exception as e:
+                        log("WARN", f"uc_gui_click_captcha 失败: {e}")
+                    
                     turnstile_passed = handle_turnstile(sb)
                     
                     if not turnstile_passed:
@@ -660,7 +749,6 @@ def main():
                     else:
                         log("INFO", "✅ Turnstile 验证通过")
                     
-                    # 截图验证后状态
                     sp_after_turnstile = screenshot_path("04-after-turnstile")
                     sb.save_screenshot(sp_after_turnstile)
                     final_screenshot = sp_after_turnstile
@@ -668,10 +756,8 @@ def main():
                     # 9. 点击广告横幅
                     log("INFO", "🖱️ 点击广告横幅...")
                     
-                    # 获取当前窗口数量
                     original_windows = len(sb.driver.window_handles)
                     
-                    # 点击广告
                     sb.execute_script("""
                         var adBanner = document.getElementById('adBanner');
                         if (adBanner) {
@@ -682,62 +768,40 @@ def main():
                                 adBanner.click();
                             }
                         }
-                        // 也尝试直接调用 openAdLink 函数
-                        if (typeof openAdLink === 'function') {
-                            openAdLink();
-                        }
                     """)
                     
                     time.sleep(3)
                     
-                    # 如果打开了新窗口，切换回原窗口
-                    current_windows = sb.driver.window_handles
-                    if len(current_windows) > original_windows:
-                        log("INFO", "检测到新窗口，切换回主窗口")
-                        sb.driver.switch_to.window(current_windows[0])
-                        time.sleep(1)
-                    
-                    # 截图点击广告后
-                    sp_after_ad = screenshot_path("05-after-ad")
-                    sb.save_screenshot(sp_after_ad)
-                    final_screenshot = sp_after_ad
-                    
-                    # 10. 等待 Complete Renewal 按钮可用
-                    log("INFO", "⏳ 等待 Complete Renewal 按钮可用...")
-                    
-                    btn_enabled = False
-                    for i in range(15):
-                        if check_renew_button_enabled(sb):
-                            btn_enabled = True
-                            log("INFO", "✅ Complete Renewal 按钮已可用")
-                            break
-                        log("INFO", f"等待按钮可用... ({i+1}/15)")
+                    # 10. 处理广告新窗口
+                    current_windows = len(sb.driver.window_handles)
+                    if current_windows > original_windows:
+                        log("INFO", f"检测到新窗口，共 {current_windows} 个")
+                        
+                        # 切换到广告窗口
+                        sb.switch_to_window(sb.driver.window_handles[-1])
                         time.sleep(2)
-                    
-                    if not btn_enabled:
-                        log("WARN", "⚠️ Complete Renewal 按钮仍被禁用")
-                        sp_btn_disabled = screenshot_path("06-btn-disabled")
-                        sb.save_screenshot(sp_btn_disabled)
-                        final_screenshot = sp_btn_disabled
                         
-                        # 保存 Cookie
-                        new_cookie_str = save_cookies_for_update(sb)
-                        if new_cookie_str:
-                            update_github_secret("BILLING_KERIT_COOKIES", new_cookie_str)
+                        sp_ad = screenshot_path("05-ad-window")
+                        sb.save_screenshot(sp_ad)
                         
-                        notify_telegram(False, "验证未完成", "Turnstile 或广告验证未通过，请手动续订", final_screenshot)
-                        sys.exit(1)
+                        # 关闭广告窗口
+                        sb.driver.close()
+                        sb.switch_to_window(sb.driver.window_handles[0])
+                        log("INFO", "已关闭广告窗口")
                     
-                    # 11. 点击 Complete Renewal 按钮
-                    log("INFO", "🎯 点击 Complete Renewal 按钮...")
+                    time.sleep(2)
+                    
+                    # 11. 点击续订按钮
+                    log("INFO", "🔘 点击最终续订按钮...")
+                    
+                    sp_before_renew = screenshot_path("06-before-renew")
+                    sb.save_screenshot(sp_before_renew)
+                    final_screenshot = sp_before_renew
+                    
                     sb.execute_script("""
                         var btn = document.getElementById('renewBtn');
                         if (btn && !btn.disabled) {
                             btn.click();
-                        }
-                        // 也尝试调用 submitRenewal 函数
-                        if (typeof submitRenewal === 'function') {
-                            submitRenewal();
                         }
                     """)
                     
@@ -767,7 +831,6 @@ def main():
                             return el ? el.textContent : '未知';
                         """) or "未知"
                         
-                        # 最终状态截图
                         sp_result = screenshot_path("08-final-status")
                         sb.save_screenshot(sp_result)
                         final_screenshot = sp_result
@@ -807,7 +870,6 @@ def main():
                 import traceback
                 traceback.print_exc()
                 
-                # 尝试截图
                 try:
                     sp_error = screenshot_path("99-error")
                     sb.save_screenshot(sp_error)
@@ -815,7 +877,6 @@ def main():
                 except:
                     pass
                 
-                # 尝试保存 Cookie
                 try:
                     new_cookie_str = save_cookies_for_update(sb)
                     if new_cookie_str:
@@ -827,7 +888,7 @@ def main():
                     False,
                     "脚本异常",
                     str(e)[:200],
-                    final_screenshot if final_screenshot and os.path.exists(final_screenshot) else None
+                    final_screenshot if final_screenshot and Path(final_screenshot).exists() else None
                 )
                 sys.exit(1)
     
@@ -837,6 +898,13 @@ def main():
         traceback.print_exc()
         notify_telegram(False, "启动失败", f"浏览器启动失败: {str(e)[:100]}")
         sys.exit(1)
+    
+    finally:
+        if display:
+            try:
+                display.stop()
+            except:
+                pass
     
     log("INFO", "🔒 浏览器已关闭")
 
