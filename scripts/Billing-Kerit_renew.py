@@ -5,6 +5,8 @@ Billing Kerit 自动续订脚本
 - 支持代理
 - 支持 Telegram 通知
 - 捕获 API 响应判断续订结果
+- Cookie 格式:session_id=值; cf_clearance=值
+- 注意: 请使用与脚本相同的代理网络获取 Cookie，cf_clearance 与 IP 绑定
 """
 
 import os
