@@ -3,6 +3,7 @@
 """
 Castle-Host 服务器自动续约脚本 (带截图)
 功能：多账号支持 + 自动启动关机服务器 + Cookie自动更新 + 截图通知
+配置变量:CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx  (多账号用,逗号分隔)
 """
 
 import os
@@ -11,7 +12,6 @@ import re
 import logging
 import asyncio
 import aiohttp
-import hashlib
 from pathlib import Path
 from enum import Enum
 from base64 import b64encode
@@ -73,19 +73,12 @@ class Config:
 def ensure_output_dir():
     """确保输出目录存在"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 输出目录已就绪: {OUTPUT_DIR}")
-
-
-def hash_id(sid: str) -> str:
-    """对服务器ID进行哈希处理，用于文件名"""
-    return hashlib.md5(sid.encode()).hexdigest()[:8]
 
 
 def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
-    """生成截图路径（使用哈希隐藏真实ID）"""
+    """生成截图路径"""
     timestamp = datetime.now().strftime("%H%M%S")
-    hashed = hash_id(server_id)
-    filename = f"acc{account_idx + 1}_srv{hashed}_{stage}_{timestamp}.png"
+    filename = f"acc{account_idx + 1}_{server_id}_{stage}_{timestamp}.png"
     return str(OUTPUT_DIR / filename)
 
 
@@ -139,7 +132,6 @@ class Notifier:
             return None
         
         if not photo_path or not Path(photo_path).exists():
-            logger.warning(f"⚠️ 截图不存在: {photo_path}，发送纯文本")
             return await self.send(caption)
         
         try:
@@ -157,8 +149,6 @@ class Notifier:
                             logger.info("✅ 通知已发送（带截图）")
                             return (await r.json()).get('result', {}).get('message_id')
                         else:
-                            error_text = await r.text()
-                            logger.error(f"❌ 图片发送失败: {error_text}")
                             return await self.send(caption)
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
@@ -178,7 +168,6 @@ class Notifier:
                     if r.status == 200:
                         logger.info("✅ 通知已发送")
                         return (await r.json()).get('result', {}).get('message_id')
-                    logger.error(f"❌ 通知失败: {await r.text()}")
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
         return None
@@ -225,11 +214,11 @@ class CastleClient:
         self.account_idx = account_idx
 
     async def take_screenshot(self, server_id: str, stage: str) -> str:
-        """截图并返回路径"""
+        """截图并返回路径（日志不显示完整路径）"""
         try:
             path = screenshot_path(self.account_idx, server_id, stage)
             await self.page.screenshot(path=path, full_page=True)
-            logger.info(f"📸 截图已保存")
+            logger.info(f"📸 截图已保存")  # 不显示路径
             return path
         except Exception as e:
             logger.error(f"❌ 截图失败: {e}")
@@ -242,7 +231,7 @@ class CastleClient:
             if await csrf_meta.count() > 0:
                 token = await csrf_meta.get_attribute('content')
                 if token:
-                    logger.info(f"🔑 CSRF token: {token[:20]}...")
+                    logger.info(f"🔑 获取CSRF token成功")  # 不显示token内容
                     return token
         except Exception as e:
             logger.error(f"❌ 获取CSRF token失败: {e}")
@@ -300,21 +289,15 @@ class CastleClient:
         return False
 
     async def get_expiry_and_prepare(self, sid: str) -> Tuple[str, Optional[str]]:
-        """
-        获取到期时间，并返回最新的 CSRF token
-        合并 get_expiry 和准备续约的逻辑，确保 CSRF token 是最新的
-        """
+        """获取到期时间，并返回最新的 CSRF token"""
         try:
-            # 导航到支付页面
             await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
             await self.page.wait_for_timeout(1500)
             
-            # 获取到期时间
             content = await self.page.text_content("body")
             match = re.search(r"(\d{2}\.\d{2}\.\d{4})", content)
             expiry = match.group(1) if match else ""
             
-            # 获取最新的 CSRF token
             csrf_token = await self.get_csrf_token()
             
             return expiry, csrf_token
@@ -323,10 +306,7 @@ class CastleClient:
             return "", None
 
     async def renew(self, sid: str, csrf_token: str) -> Tuple[RenewalStatus, str, str]:
-        """
-        续约服务器 - 使用传入的 CSRF token
-        返回 (状态, 消息, 截图路径)
-        """
+        """续约服务器"""
         masked = mask_id(sid)
         screenshot_file = ""
         
@@ -336,18 +316,15 @@ class CastleClient:
                 screenshot_file = await self.take_screenshot(sid, "error")
                 return RenewalStatus.FAILED, "无效的CSRF token", screenshot_file
             
-            # 确保在支付页面（不重新导航，使用已有的页面状态）
             current_url = self.page.url
             if f"/pay/index/{sid}" not in current_url:
                 await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
                 await self.page.wait_for_timeout(1000)
-                # 重新获取 CSRF token
                 csrf_token = await self.get_csrf_token()
                 if not csrf_token:
                     screenshot_file = await self.take_screenshot(sid, "error")
                     return RenewalStatus.FAILED, "重新获取CSRF token失败", screenshot_file
             
-            # 发送API请求
             response = await self.page.request.post(
                 f"{self.BASE}/servers/pay/buy_months/{sid}",
                 headers={
@@ -360,20 +337,17 @@ class CastleClient:
             
             logger.info(f"🖱️ 服务器 {masked} 已请求续约")
             
-            # 解析响应
             try:
                 data = await response.json()
             except:
                 text = await response.text()
-                logger.error(f"❌ 响应解析失败: {text[:200]}")
+                logger.error(f"❌ 响应解析失败")
                 screenshot_file = await self.take_screenshot(sid, "error")
                 return RenewalStatus.FAILED, "响应解析失败", screenshot_file
             
-            # 刷新页面获取最新状态用于截图
             await self.page.reload(wait_until="networkidle")
             await self.page.wait_for_timeout(1000)
             
-            # 处理结果
             if data.get("status") == "error":
                 error_msg = data.get("error", "未知错误")
                 logger.info(f"📝 结果: {error_msg}")
@@ -384,11 +358,11 @@ class CastleClient:
             
             if data.get("status") == "success":
                 success_msg = data.get("success", "续约成功")
-                logger.info(f"📝 结果: ✅ {success_msg}")
+                logger.info(f"📝 结果: ✅ 续约成功")
                 screenshot_file = await self.take_screenshot(sid, "success")
                 return RenewalStatus.SUCCESS, success_msg, screenshot_file
             
-            logger.info(f"📝 结果: {data}")
+            logger.info(f"📝 结果: 未知响应")
             screenshot_file = await self.take_screenshot(sid, "unknown")
             return RenewalStatus.FAILED, str(data), screenshot_file
             
@@ -442,15 +416,11 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                 masked = mask_id(sid)
                 logger.info(f"--- 处理服务器 {masked} ---")
                 
-                # 1. 检查并启动服务器（如果已关机）
                 started = await client.start_if_stopped(sid)
-                
-                # 2. 获取到期时间和最新的 CSRF token（合并操作）
                 expiry, csrf_token = await client.get_expiry_and_prepare(sid)
                 d = days_left(expiry)
                 logger.info(f"📅 到期: {convert_date(expiry)} ({d}天)")
                 
-                # 3. 执行续约（使用刚获取的 CSRF token）
                 if csrf_token:
                     status, msg, screenshot = await client.renew(sid, csrf_token)
                 else:
@@ -461,7 +431,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                 results.append(ServerResult(sid, status, msg, expiry, d, started, screenshot))
                 await asyncio.sleep(2)
 
-            # 发送通知（带截图）
+            # 发送通知
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
                     status_icon = "✅"
@@ -509,7 +479,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
 
 async def main():
     logger.info("=" * 50)
-    logger.info("🏰 Castle-Host 自动续约 (带截图)")
+    logger.info("🏰 Castle-Host 自动续约")
     logger.info("=" * 50)
 
     ensure_output_dir()
