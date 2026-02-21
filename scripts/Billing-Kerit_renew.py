@@ -80,12 +80,23 @@ def screenshot_path(name: str) -> str:
 
 
 def mask(s: str, show: int = 2) -> str:
+    """脱敏显示"""
     if not s:
         return "***"
     s = str(s)
     if len(s) <= show * 2:
         return s[:show] + "***"
     return s[:show] + "***" + s[-show:]
+
+
+def mask_ip(ip: str) -> str:
+    """IP 地址脱敏"""
+    if not ip:
+        return "***"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return f"{parts[0]}.***.***.{parts[3]}"
+    return mask(ip)
 
 
 def is_linux():
@@ -110,11 +121,12 @@ def setup_display():
 
 
 def parse_cookie_string(cookie_str: str):
-    """解析 Cookie 字符串"""
+    """解析 Cookie 字符串，去重处理"""
     if not cookie_str:
         return []
     
-    cookies = []
+    cookies_dict = {}  # 使用字典去重，后面的会覆盖前面的
+    
     for item in cookie_str.split(";"):
         item = item.strip()
         if not item or "=" not in item:
@@ -129,21 +141,24 @@ def parse_cookie_string(cookie_str: str):
         except:
             pass
         
-        cookies.append({"name": name, "value": value})
+        # 使用字典去重
+        cookies_dict[name] = value
     
+    cookies = [{"name": k, "value": v} for k, v in cookies_dict.items()]
     cookie_names = [c["name"] for c in cookies]
     log("INFO", f"解析到 {len(cookies)} 个 Cookie: {', '.join(cookie_names)}")
     return cookies
 
 
 def test_proxy(proxy_url: str) -> bool:
-    """测试代理连接"""
+    """测试代理连接（不显示完整 IP）"""
     if not proxy_url:
         return False
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
         resp = requests.get("https://api.ipify.org", proxies=proxies, timeout=10)
-        log("INFO", f"代理 IP: {resp.text}")
+        ip = resp.text.strip()
+        log("INFO", f"代理 IP: {mask_ip(ip)}")  # 脱敏显示
         return True
     except Exception as e:
         log("WARN", f"代理测试失败: {e}")
@@ -273,22 +288,23 @@ def save_cookies_for_update(sb) -> str:
         cookies = sb.get_cookies()
         important_names = ["session_id", "cf_clearance"]
         
-        filtered = []
+        # 使用字典去重
+        cookie_dict = {}
         for c in cookies:
             name = c.get("name", "")
             if name in important_names:
-                filtered.append(c)
+                cookie_dict[name] = c.get("value", "")
         
-        if not filtered:
+        if not cookie_dict:
             log("WARN", "未找到关键 Cookie")
             return ""
         
-        cookie_string = "; ".join([f"{c['name']}={quote(str(c.get('value', '')), safe='')}" for c in filtered])
+        cookie_string = "; ".join([f"{k}={quote(str(v), safe='')}" for k, v in cookie_dict.items()])
         
         cookie_file = OUTPUT_DIR / "new_cookies.txt"
         with open(cookie_file, "w") as f:
             f.write(cookie_string)
-        log("INFO", f"新 Cookie 已保存 ({len(filtered)} 个)")
+        log("INFO", f"新 Cookie 已保存 ({len(cookie_dict)} 个)")
         
         return cookie_string
     except Exception as e:
@@ -532,6 +548,29 @@ def check_access_blocked(sb) -> bool:
         return False
 
 
+def check_redirect_loop(sb) -> bool:
+    """检查是否发生重定向循环"""
+    try:
+        page_source = sb.get_page_source()
+        if "ERR_TOO_MANY_REDIRECTS" in page_source or "redirected you too many times" in page_source:
+            return True
+        return False
+    except:
+        return False
+
+
+def clear_cookies_and_retry(sb):
+    """清除 Cookie 并重新获取 cf_clearance"""
+    log("INFO", "🧹 清除 Cookie，准备重新获取...")
+    try:
+        sb.delete_all_cookies()
+        time.sleep(1)
+        return True
+    except Exception as e:
+        log("ERROR", f"清除 Cookie 失败: {e}")
+        return False
+
+
 # ==================== 主逻辑 ====================
 
 def main():
@@ -597,74 +636,128 @@ def main():
             log("INFO", "浏览器已启动")
             
             try:
-                # 1. 设置 Cookie
-                log("INFO", "🍪 注入 Cookie...")
-                sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=5)
-                time.sleep(3)
+                # 1. 先访问网站（不带旧 Cookie），让 CF 生成新的 cf_clearance
+                log("INFO", "🌐 首次访问网站，获取 Cloudflare 验证...")
+                sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=8)
+                time.sleep(5)
                 
                 # 检查是否被阻止
                 if check_access_blocked(sb):
                     sp_blocked = screenshot_path("00-access-blocked")
                     sb.save_screenshot(sp_blocked)
                     log("ERROR", "❌ 访问被阻止 - IP 被限制")
-                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    notify_telegram(False, "访问被阻止", "IP 被限制，请更换代理节点", sp_blocked)
                     sys.exit(1)
                 
-                for c in cookies:
-                    sb.add_cookie({
-                        "name": c["name"],
-                        "value": c["value"],
-                        "domain": DOMAIN,
-                        "path": "/"
-                    })
-                log("INFO", "Cookie 已设置")
+                # 尝试通过 Cloudflare 验证
+                try:
+                    sb.uc_gui_click_captcha()
+                    time.sleep(3)
+                except:
+                    pass
                 
-                # 2. 访问首页
+                sp_cf = screenshot_path("00-cf-challenge")
+                sb.save_screenshot(sp_cf)
+                
+                # 等待 CF 验证完成
+                for i in range(30):
+                    current_url = sb.get_current_url()
+                    if "/session" in current_url or "/login" in current_url or "/free_panel" in current_url:
+                        log("INFO", "✅ Cloudflare 验证通过")
+                        break
+                    if check_access_blocked(sb):
+                        sp_blocked = screenshot_path("00-blocked")
+                        sb.save_screenshot(sp_blocked)
+                        log("ERROR", "❌ 访问被阻止")
+                        notify_telegram(False, "访问被阻止", "IP 被限制", sp_blocked)
+                        sys.exit(1)
+                    time.sleep(1)
+                
+                # 2. 现在注入 session_id Cookie（只要 session_id，不要旧的 cf_clearance）
+                log("INFO", "🍪 注入 session_id Cookie...")
+                
+                for c in cookies:
+                    if c["name"] == "session_id":  # 只注入 session_id
+                        sb.add_cookie({
+                            "name": c["name"],
+                            "value": c["value"],
+                            "domain": DOMAIN,
+                            "path": "/"
+                        })
+                        log("INFO", f"已注入 Cookie: {c['name']}")
+                
+                # 3. 访问 session 页面
                 log("INFO", f"🔗 访问 {SESSION_URL}...")
-                sb.uc_open_with_reconnect(SESSION_URL, reconnect_time=5)
-                time.sleep(3)
+                sb.uc_open_with_reconnect(SESSION_URL, reconnect_time=8)
+                time.sleep(5)
                 
                 current_url = sb.get_current_url()
                 log("INFO", f"当前 URL: {current_url}")
                 
-                # 再次检查是否被阻止
+                # 检查重定向循环
+                if check_redirect_loop(sb):
+                    sp_redirect = screenshot_path("01-redirect-loop")
+                    sb.save_screenshot(sp_redirect)
+                    log("ERROR", "❌ 重定向循环 - Cookie 可能已失效")
+                    notify_telegram(False, "Cookie 失效", "发生重定向循环，请更新 session_id Cookie", sp_redirect)
+                    sys.exit(1)
+                
+                # 检查是否被阻止
                 if check_access_blocked(sb):
                     sp_blocked = screenshot_path("01-access-blocked")
                     sb.save_screenshot(sp_blocked)
                     log("ERROR", "❌ 访问被阻止 - IP 被限制")
-                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    notify_telegram(False, "访问被阻止", "IP 被限制", sp_blocked)
                     sys.exit(1)
                 
                 sp_home = screenshot_path("01-homepage")
                 sb.save_screenshot(sp_home)
                 final_screenshot = sp_home
                 
-                # 3. 检查登录状态
+                # 检查登录状态
                 if "/login" in current_url or "/auth" in current_url:
-                    log("ERROR", "❌ Cookie 已失效，需要重新登录")
-                    notify_telegram(False, "登录检查", "Cookie 已失效，请更新 Cookie", sp_home)
+                    log("ERROR", "❌ session_id Cookie 已失效，需要重新登录")
+                    notify_telegram(False, "登录检查", "session_id Cookie 已失效，请更新 Cookie", sp_home)
                     sys.exit(1)
                 
                 log("INFO", "✅ Cookie 有效，已登录")
                 
                 # 4. 进入 Free Plans 页面
                 log("INFO", "🎁 进入 Free Plans 页面...")
-                sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=5)
-                time.sleep(3)
+                sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=8)
+                time.sleep(5)
+                
+                current_url = sb.get_current_url()
+                log("INFO", f"当前 URL: {current_url}")
+                
+                # 检查重定向循环
+                if check_redirect_loop(sb):
+                    sp_redirect = screenshot_path("02-redirect-loop")
+                    sb.save_screenshot(sp_redirect)
+                    log("ERROR", "❌ 重定向循环")
+                    notify_telegram(False, "重定向循环", "请更新 Cookie", sp_redirect)
+                    sys.exit(1)
                 
                 # 检查是否被阻止
                 if check_access_blocked(sb):
                     sp_blocked = screenshot_path("02-access-blocked")
                     sb.save_screenshot(sp_blocked)
                     log("ERROR", "❌ 访问被阻止 - IP 被限制")
-                    notify_telegram(False, "访问被阻止", "IP 被限制，请配置有效代理 (PROXY_NODE)", sp_blocked)
+                    notify_telegram(False, "访问被阻止", "IP 被限制", sp_blocked)
                     sys.exit(1)
+                
+                # 检查是否成功进入 free_panel
+                if "/free_panel" not in current_url:
+                    log("WARN", f"未能进入 free_panel 页面，当前: {current_url}")
+                    # 再试一次
+                    time.sleep(2)
+                    sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=8)
+                    time.sleep(5)
+                    current_url = sb.get_current_url()
                 
                 sp_free = screenshot_path("02-free-plans")
                 sb.save_screenshot(sp_free)
                 final_screenshot = sp_free
-                
-                log("INFO", f"当前 URL: {sb.get_current_url()}")
                 
                 # 5. 获取续订信息
                 log("INFO", "🔍 检查续订状态...")
@@ -753,11 +846,14 @@ def main():
                     sb.save_screenshot(sp_after_turnstile)
                     final_screenshot = sp_after_turnstile
                     
-                    # 9. 点击广告横幅
+                    # 9. 点击广告横幅（在新标签页中打开，不影响当前页面）
                     log("INFO", "🖱️ 点击广告横幅...")
                     
-                    original_windows = len(sb.driver.window_handles)
+                    # 记录当前窗口
+                    main_window = sb.driver.current_window_handle
+                    original_windows = set(sb.driver.window_handles)
                     
+                    # 点击广告
                     sb.execute_script("""
                         var adBanner = document.getElementById('adBanner');
                         if (adBanner) {
@@ -772,24 +868,53 @@ def main():
                     
                     time.sleep(3)
                     
-                    # 10. 处理广告新窗口
-                    current_windows = len(sb.driver.window_handles)
-                    if current_windows > original_windows:
-                        log("INFO", f"检测到新窗口，共 {current_windows} 个")
+                    # 10. 处理广告新窗口（关闭它，回到主窗口）
+                    current_windows = set(sb.driver.window_handles)
+                    new_windows = current_windows - original_windows
+                    
+                    if new_windows:
+                        log("INFO", f"检测到 {len(new_windows)} 个新窗口，正在关闭...")
                         
-                        # 切换到广告窗口
-                        sb.switch_to_window(sb.driver.window_handles[-1])
-                        time.sleep(2)
+                        for new_win in new_windows:
+                            try:
+                                sb.driver.switch_to.window(new_win)
+                                time.sleep(0.5)
+                                sp_ad = screenshot_path("05-ad-window")
+                                sb.save_screenshot(sp_ad)
+                                sb.driver.close()
+                                log("INFO", "已关闭广告窗口")
+                            except Exception as e:
+                                log("WARN", f"关闭窗口失败: {e}")
                         
-                        sp_ad = screenshot_path("05-ad-window")
-                        sb.save_screenshot(sp_ad)
-                        
-                        # 关闭广告窗口
-                        sb.driver.close()
-                        sb.switch_to_window(sb.driver.window_handles[0])
-                        log("INFO", "已关闭广告窗口")
+                        # 切回主窗口
+                        sb.driver.switch_to.window(main_window)
+                        log("INFO", "已切回主窗口")
                     
                     time.sleep(2)
+                    
+                    # 确认还在续订页面
+                    current_url = sb.get_current_url()
+                    log("INFO", f"当前 URL: {current_url}")
+                    
+                    if "/free_panel" not in current_url:
+                        log("WARN", "页面发生跳转，重新打开续订页面...")
+                        sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=5)
+                        time.sleep(3)
+                        
+                        # 重新点击续订按钮
+                        sb.execute_script("""
+                            var btn = document.getElementById('renewServerBtn');
+                            if (btn) btn.click();
+                        """)
+                        time.sleep(2)
+                        
+                        # 重新处理 Turnstile
+                        try:
+                            sb.uc_gui_click_captcha()
+                            time.sleep(2)
+                        except:
+                            pass
+                        handle_turnstile(sb, max_attempts=3)
                     
                     # 11. 点击续订按钮
                     log("INFO", "🔘 点击最终续订按钮...")
@@ -798,12 +923,34 @@ def main():
                     sb.save_screenshot(sp_before_renew)
                     final_screenshot = sp_before_renew
                     
-                    sb.execute_script("""
+                    # 检查 renewBtn 是否可点击
+                    renew_btn_ready = sb.execute_script("""
                         var btn = document.getElementById('renewBtn');
-                        if (btn && !btn.disabled) {
-                            btn.click();
-                        }
+                        if (!btn) return {exists: false};
+                        return {
+                            exists: true,
+                            disabled: btn.disabled,
+                            visible: btn.offsetParent !== null
+                        };
                     """)
+                    
+                    log("INFO", f"续订按钮状态: {renew_btn_ready}")
+                    
+                    if renew_btn_ready and renew_btn_ready.get("exists") and not renew_btn_ready.get("disabled"):
+                        sb.execute_script("""
+                            var btn = document.getElementById('renewBtn');
+                            if (btn && !btn.disabled) {
+                                btn.click();
+                            }
+                        """)
+                        log("INFO", "已点击 renewBtn")
+                    else:
+                        log("WARN", "renewBtn 不可用，尝试其他方式...")
+                        # 尝试直接提交
+                        sb.execute_script("""
+                            var form = document.querySelector('form');
+                            if (form) form.submit();
+                        """)
                     
                     time.sleep(5)
                     
@@ -818,8 +965,8 @@ def main():
                     
                     # 重新获取续订信息
                     try:
-                        sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=3)
-                        time.sleep(2)
+                        sb.uc_open_with_reconnect(FREE_PANEL_URL, reconnect_time=5)
+                        time.sleep(3)
                         
                         new_renewal_count = sb.execute_script("""
                             var el = document.getElementById('renewal-count');
@@ -848,7 +995,7 @@ def main():
                         log("INFO", "⚠️ 已达到续订限制")
                         result_message = f"续订次数: {new_renewal_count}/7\n状态: {new_status_text}\n\n⚠️ 已达到每周续订限制"
                         notify_telegram(True, "续订完成", result_message, final_screenshot)
-                    elif result == "success" or (renewal_count != new_renewal_count):
+                    elif result == "success" or (renewal_count != "未知" and new_renewal_count != "未知" and renewal_count != new_renewal_count):
                         log("INFO", "🎉 续订成功!")
                         result_message = f"续订次数: {new_renewal_count}/7\n状态: {new_status_text}\n\n✅ 服务器续订成功！"
                         notify_telegram(True, "续订成功", result_message, final_screenshot)
