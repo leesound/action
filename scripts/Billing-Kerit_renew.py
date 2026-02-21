@@ -26,9 +26,10 @@ FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 SESSION_URL = "https://billing.kerit.cloud/session"
 BASE_DOMAIN = "billing.kerit.cloud"
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-GITHUB_TOKEN = os.environ.get("GH_TOKEN", "")
+# 环境变量 - 与 workflow 保持一致
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+REPO_TOKEN = os.environ.get("REPO_TOKEN", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 
 PROXY_SOCKS5 = os.environ.get("PROXY_SOCKS5", "")
@@ -36,8 +37,9 @@ PROXY_HTTP = os.environ.get("PROXY_HTTP", "")
 
 COOKIES_STR = os.environ.get("BILLING_KERIT_COOKIES", "")
 
-SCREENSHOT_DIR = Path("screenshots")
-SCREENSHOT_DIR.mkdir(exist_ok=True)
+# 截图目录 - 与 workflow 上传路径一致
+SCREENSHOT_DIR = Path("output/screenshots")
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def log(level: str, message: str):
@@ -90,7 +92,7 @@ def parse_cookies(cookie_str: str) -> list:
         return []
     
     cookies = []
-    seen = {}  # 用于去重，保留最后一个
+    seen = {}
     
     for part in cookie_str.split(";"):
         part = part.strip()
@@ -109,7 +111,7 @@ def parse_cookies(cookie_str: str) -> list:
 
 def notify_telegram(success: bool, title: str, message: str, image_path: str = None):
     """发送 Telegram 通知"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("WARN", "Telegram 未配置，跳过通知")
         return
     
@@ -118,10 +120,10 @@ def notify_telegram(success: bool, title: str, message: str, image_path: str = N
     
     try:
         if image_path and Path(image_path).exists():
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
             with open(image_path, "rb") as f:
                 files = {"photo": f}
-                data = {"chat_id": TELEGRAM_CHAT_ID, "caption": text, "parse_mode": "Markdown"}
+                data = {"chat_id": TG_CHAT_ID, "caption": text, "parse_mode": "Markdown"}
                 resp = requests.post(url, data=data, files=files, timeout=30)
             if resp.status_code == 200:
                 log("INFO", "Telegram 图片已发送")
@@ -136,9 +138,11 @@ def notify_telegram(success: bool, title: str, message: str, image_path: str = N
 
 def send_text_only(text: str):
     """仅发送文本消息"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
         requests.post(url, data=data, timeout=15)
         log("INFO", "Telegram 消息已发送")
     except Exception as e:
@@ -147,7 +151,7 @@ def send_text_only(text: str):
 
 def update_github_secret(secret_name: str, secret_value: str):
     """更新 GitHub Secret"""
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+    if not REPO_TOKEN or not GITHUB_REPOSITORY:
         log("WARN", "GitHub 配置缺失，跳过更新 Secret")
         return
     
@@ -155,7 +159,7 @@ def update_github_secret(secret_name: str, secret_value: str):
         from nacl import public, encoding
         
         headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
+            "Authorization": f"token {REPO_TOKEN}",
             "Accept": "application/vnd.github.v3+json"
         }
         
@@ -387,7 +391,6 @@ def handle_turnstile(sb, max_attempts: int = 6) -> bool:
     
     for attempt in range(max_attempts):
         try:
-            # 检查是否存在 Turnstile
             has_turnstile = sb.execute_script("""
                 return !!(document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
                          document.querySelector('[class*="turnstile"]') ||
@@ -400,7 +403,6 @@ def handle_turnstile(sb, max_attempts: int = 6) -> bool:
             
             log("INFO", f"检测到 Turnstile, 尝试 {attempt + 1}/{max_attempts}")
             
-            # 检查是否已通过
             is_checked = sb.execute_script("""
                 var response = document.querySelector('input[name="cf-turnstile-response"]');
                 if (response && response.value && response.value.length > 10) return true;
@@ -424,7 +426,6 @@ def handle_turnstile(sb, max_attempts: int = 6) -> bool:
                 log("INFO", "✅ Turnstile 已通过!")
                 return True
             
-            # 尝试点击
             sb.execute_script("""
                 var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                 if (iframe) {
@@ -445,7 +446,6 @@ def handle_turnstile(sb, max_attempts: int = 6) -> bool:
             
             time.sleep(3)
             
-            # 再次检查
             is_checked = sb.execute_script("""
                 var response = document.querySelector('input[name="cf-turnstile-response"]');
                 return response && response.value && response.value.length > 10;
@@ -469,20 +469,15 @@ def check_login_status(sb) -> bool:
     try:
         current_url = sb.get_current_url()
         
-        # 如果在登录页，说明未登录
         if "/login" in current_url or "/register" in current_url:
             return False
         
-        # 如果在 session 或其他页面，检查页面内容
         is_logged_in = sb.execute_script("""
             var bodyText = document.body.innerText || '';
             
-            // 检查是否有登录后才有的元素
             if (document.querySelector('[href*="logout"]')) return true;
             if (document.querySelector('[href*="free_panel"]')) return true;
             if (bodyText.includes('Free Plans') || bodyText.includes('Dashboard')) return true;
-            
-            // 检查是否有需要登录的提示
             if (bodyText.includes('Please log in') || bodyText.includes('Sign in')) return false;
             
             return null;
@@ -493,7 +488,6 @@ def check_login_status(sb) -> bool:
         elif is_logged_in is False:
             return False
         
-        # 不确定，尝试访问 free_panel
         return "/free_panel" in current_url or "/session" in current_url
         
     except Exception as e:
@@ -563,10 +557,9 @@ def main():
     try:
         log("INFO", "🌐 启动浏览器...")
         
-        # 构建浏览器参数
         sb_kwargs = {
             "uc": True,
-            "headless": False,  # UC 模式需要非 headless
+            "headless": False,
             "locale_code": "en",
             "test": True,
         }
@@ -586,7 +579,6 @@ def main():
                 log("INFO", "🌐 首次访问网站，获取 Cloudflare 验证...")
                 sb.uc_open_with_reconnect("https://billing.kerit.cloud/", reconnect_time=10)
                 
-                # 等待 Cloudflare 验证
                 for i in range(30):
                     time.sleep(2)
                     current_url = sb.get_current_url()
@@ -601,7 +593,7 @@ def main():
                         except:
                             pass
                 
-                # 2. 注入 session_id Cookie（仅注入 session_id，让 cf_clearance 保持新获取的）
+                # 2. 注入 session_id Cookie
                 if session_cookie:
                     log("INFO", "🍪 注入 session_id Cookie...")
                     try:
@@ -627,7 +619,6 @@ def main():
                 sb.save_screenshot(sp_session)
                 final_screenshot = sp_session
                 
-                # 检查登录状态
                 if not check_login_status(sb):
                     log("ERROR", "❌ 未登录，Cookie 可能已失效")
                     notify_telegram(False, "登录失败", "Cookie 已失效，请手动更新", sp_session)
@@ -691,7 +682,6 @@ def main():
                     # 7. 开始续订流程
                     log("INFO", "✨ 续订按钮可用，开始续订流程...")
                     
-                    # 记录续订前次数
                     renewal_count_before = renewal_count
                     
                     sb.execute_script("""
@@ -770,7 +760,7 @@ def main():
                     current_url = sb.get_current_url()
                     log("INFO", f"当前 URL: {current_url}")
                     
-                    # 10. 设置网络拦截（在点击续订前）
+                    # 10. 设置网络拦截
                     setup_network_interception(sb)
                     
                     # 11. 点击最终续订按钮
@@ -810,7 +800,7 @@ def main():
                     sb.save_screenshot(sp_after_renew)
                     final_screenshot = sp_after_renew
                     
-                    # 12. 检查续订结果（使用 API 拦截）
+                    # 12. 检查续订结果
                     result = check_renewal_result(sb)
                     log("INFO", f"续订结果检查: {result['status']}")
                     
@@ -823,7 +813,6 @@ def main():
                     time.sleep(2)
                     
                     try:
-                        # 关闭模态框
                         sb.execute_script("""
                             var closeBtn = document.querySelector('#renewalModal .close, [data-dismiss="modal"]');
                             if (closeBtn) closeBtn.click();
@@ -831,8 +820,6 @@ def main():
                             if (backdrop) backdrop.remove();
                         """)
                         time.sleep(1)
-                        
-                        # 刷新页面获取最新状态
                         sb.refresh()
                         time.sleep(3)
                     except:
@@ -866,7 +853,6 @@ def main():
                     elif result["status"] == "error":
                         log("ERROR", f"❌ 续订失败: {result['message']}")
                     else:
-                        # API 结果不明确，比较续订次数
                         try:
                             before_num = int(renewal_count_before.split("/")[0]) if "/" in str(renewal_count_before) else int(renewal_count_before)
                             after_num = int(new_renewal_count.split("/")[0]) if "/" in str(new_renewal_count) else 0
