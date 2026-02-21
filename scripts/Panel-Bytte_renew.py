@@ -120,7 +120,7 @@ def save_cookies_for_update(cookies: list) -> str:
     
     cookie_file = OUTPUT_DIR / "new_cookies.txt"
     cookie_file.write_text(cookie_string)
-    log("INFO", f"新 Cookie 已保存")
+    log("INFO", f"新 Cookie 已保存到文件")
     
     return cookie_string
 
@@ -247,12 +247,12 @@ def send_text_only(bot_token: str, chat_id: str, text: str):
         log("WARN", f"发送文本失败: {e}")
 
 
-# ==================== 主逻辑 ====================
+# ==================== 业务逻辑 ====================
 
 def check_need_restart(page) -> bool:
     """
     检查是否需要重启
-    - 如果 Start 按钮可用（未禁用），说明服务器已停止，需要启动/重启
+    - 如果 Start 按钮可用（未禁用），说明服务器已停止，需要启动
     - 如果 Stop 按钮禁用，说明服务器已停止
     """
     try:
@@ -281,7 +281,7 @@ def check_need_restart(page) -> bool:
 
 
 def do_restart(page) -> bool:
-    """执行重启操作"""
+    """执行重启/启动操作"""
     try:
         # 先尝试点击 Start 按钮
         start_btn = page.locator('#power-start')
@@ -314,59 +314,141 @@ def do_restart(page) -> bool:
 def check_and_renew(page) -> dict:
     """
     检查续约信息并执行续约
-    返回: {"need_renew": bool, "renewed": bool, "expiration": str, "balance": str, "price": str}
+    返回: {"need_renew": bool, "renewed": bool, "expiration": str, "balance": str, "price": str, "message": str}
     """
     result = {
         "need_renew": False,
         "renewed": False,
         "expiration": "",
         "balance": "",
-        "price": ""
+        "price": "",
+        "message": ""
     }
     
     try:
-        # 获取余额
-        balance_elem = page.locator('code.RenewServerBox___StyledCode-sc-pwczq4-3')
-        if balance_elem.count() > 0:
-            result["balance"] = balance_elem.inner_text().strip()
-            log("INFO", f"💰 余额: {result['balance']}")
+        # 等待页面加载
+        page.wait_for_timeout(2000)
         
-        # 获取过期时间
-        expiration_elem = page.locator('code.RenewServerBox___StyledCode2-sc-pwczq4-5')
-        if expiration_elem.count() > 0:
-            result["expiration"] = expiration_elem.inner_text().strip()
-            log("INFO", f"📅 到期时间: {result['expiration']}")
+        # 1. 获取余额
+        balance_selectors = [
+            'code.RenewServerBox___StyledCode-sc-pwczq4-3',
+            '.RenewServerBox___StyledDiv2-sc-pwczq4-2 code',
+            'code.TqUPO'
+        ]
+        for selector in balance_selectors:
+            balance_elem = page.locator(selector)
+            if balance_elem.count() > 0:
+                result["balance"] = balance_elem.first.inner_text().strip()
+                log("INFO", f"💰 账户余额: {result['balance']}")
+                break
         
-        # 查找续约按钮
-        renew_btn = page.locator('button:has-text("Renew Server")')
-        if renew_btn.count() > 0:
-            btn_text = renew_btn.inner_text().strip()
-            # 提取价格，如 "Renew Server - 0.00 USD"
-            if "-" in btn_text:
-                result["price"] = btn_text.split("-")[1].strip()
+        # 2. 获取过期时间
+        expiration_selectors = [
+            'code.RenewServerBox___StyledCode2-sc-pwczq4-5',
+            '.RenewServerBox___StyledDiv3-sc-pwczq4-4 code',
+            'code.kggZVS'
+        ]
+        for selector in expiration_selectors:
+            expiration_elem = page.locator(selector)
+            if expiration_elem.count() > 0:
+                result["expiration"] = expiration_elem.first.inner_text().strip()
+                log("INFO", f"📅 到期时间: {result['expiration']}")
+                break
+        
+        # 3. 查找续约按钮
+        renew_selectors = [
+            'button:has-text("Renew Server")',
+            '.RenewServerBox___StyledDiv4-sc-pwczq4-8 button',
+            'button.bvYLfo'
+        ]
+        
+        renew_btn = None
+        btn_text = ""
+        
+        for selector in renew_selectors:
+            btn = page.locator(selector)
+            if btn.count() > 0:
+                renew_btn = btn.first
+                btn_text = renew_btn.inner_text().strip()
+                log("INFO", f"🔘 找到续约按钮: {btn_text}")
+                break
+        
+        if not renew_btn or not btn_text:
+            result["message"] = "未找到续约按钮"
+            log("INFO", "ℹ️ 未找到续约按钮")
+            return result
+        
+        # 4. 解析价格
+        # 按钮文本格式: "Renew Server - 0.00 USD"
+        if "-" in btn_text:
+            price_part = btn_text.split("-")[-1].strip()
+            result["price"] = price_part
+            log("INFO", f"💵 续约价格: {price_part}")
+        
+        # 5. 判断是否可以免费续约
+        is_free = False
+        if "0.00" in btn_text:
+            is_free = True
+        elif result["price"]:
+            try:
+                import re
+                price_match = re.search(r'(\d+\.?\d*)', result["price"])
+                if price_match:
+                    price_value = float(price_match.group(1))
+                    is_free = (price_value == 0)
+            except:
+                pass
+        
+        if is_free:
+            result["need_renew"] = True
+            log("INFO", "🆓 可免费续约!")
             
-            # 检查是否免费续约（价格为 0）
-            if "0.00" in btn_text:
-                result["need_renew"] = True
-                log("INFO", "🆓 可免费续约!")
-                
-                # 点击续约按钮
-                log("INFO", "🔄 点击续约按钮...")
-                renew_btn.click()
-                page.wait_for_timeout(3000)
-                
+            # 点击续约按钮
+            log("INFO", "🔄 点击续约按钮...")
+            renew_btn.click()
+            page.wait_for_timeout(2000)
+            
+            # 等待确认弹窗出现并点击 "Yes, Renew Server"
+            confirm_selectors = [
+                'button:has-text("Yes, Renew Server")',
+                'button:has-text("Yes, renew server")',
+                '.ConfirmationModal___StyledButton2-sc-1sxt2cr-4',
+                'button.iNKfxp'
+            ]
+            
+            confirm_clicked = False
+            for selector in confirm_selectors:
+                try:
+                    confirm_btn = page.locator(selector)
+                    if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                        log("INFO", "📝 找到确认按钮，点击 'Yes, Renew Server'...")
+                        confirm_btn.first.click()
+                        page.wait_for_timeout(3000)
+                        confirm_clicked = True
+                        break
+                except:
+                    continue
+            
+            if confirm_clicked:
                 result["renewed"] = True
+                result["message"] = "免费续约成功"
                 log("INFO", "✅ 续约成功!")
             else:
-                log("INFO", f"💵 续约需要付费: {result['price']}")
+                result["message"] = "未找到确认按钮"
+                log("WARN", "⚠️ 未找到确认按钮，续约可能未完成")
+            
         else:
-            log("INFO", "未找到续约按钮")
+            result["message"] = f"需付费续约: {result['price']}"
+            log("INFO", f"💵 续约需要付费: {result['price']}，跳过")
         
     except Exception as e:
         log("ERROR", f"续约检查失败: {e}")
+        result["message"] = f"检查失败: {str(e)[:50]}"
     
     return result
 
+
+# ==================== 主函数 ====================
 
 def main():
     """主函数"""
@@ -443,6 +525,7 @@ def main():
         page.on("response", handle_response)
         
         final_screenshot = None
+        new_cookie_str = ""  # 用于最后更新
         
         try:
             # 1. 注入 Cookie
@@ -471,7 +554,7 @@ def main():
             
             log("INFO", "✅ Cookie 有效，已登录")
             
-            # 移除 API 拦截（只需要首页数据）
+            # 移除 API 拦截
             page.remove_listener("response", handle_response)
             
             # 关闭可能的弹窗
@@ -489,15 +572,7 @@ def main():
             page.screenshot(path=sp_dashboard, full_page=True)
             final_screenshot = sp_dashboard
             
-            # 5. 保存新 Cookie
-            new_cookies = context.cookies()
-            new_cookie_str = save_cookies_for_update(new_cookies)
-            
-            # 6. 更新 GitHub Secret
-            if new_cookie_str:
-                update_github_secret("PANEL_BYTTE_COOKIES", new_cookie_str)
-            
-            # 7. 获取服务器列表
+            # 5. 获取服务器列表
             servers = api_servers
             
             if not servers:
@@ -509,7 +584,7 @@ def main():
             
             log("INFO", f"📋 共找到 {len(servers)} 个服务器")
             
-            # 8. 遍历服务器执行操作
+            # 6. 遍历服务器执行操作
             results = []
             
             for idx, server in enumerate(servers):
@@ -530,7 +605,7 @@ def main():
                 }
                 
                 try:
-                    # ========== 步骤 A: 进入服务器控制台页面检查重启 ==========
+                    # ========== 步骤 A: 检查重启状态 ==========
                     log("INFO", "")
                     log("INFO", "📍 步骤 A: 检查重启状态...")
                     page.goto(server_url, wait_until="networkidle", timeout=60000)
@@ -539,7 +614,6 @@ def main():
                     sp_console = screenshot_path(f"04-console-{idx + 1}")
                     page.screenshot(path=sp_console, full_page=True)
                     
-                    # 检查是否需要重启
                     need_restart = check_need_restart(page)
                     server_result["restart"]["needed"] = need_restart
                     
@@ -551,7 +625,7 @@ def main():
                         page.screenshot(path=sp_after_restart, full_page=True)
                         final_screenshot = sp_after_restart
                     
-                    # ========== 步骤 B: 进入设置页面检查续约 ==========
+                    # ========== 步骤 B: 检查续约状态 ==========
                     log("INFO", "")
                     log("INFO", "📍 步骤 B: 检查续约状态...")
                     settings_url = f"{server_url}/settings"
@@ -562,7 +636,6 @@ def main():
                     page.screenshot(path=sp_settings, full_page=True)
                     final_screenshot = sp_settings
                     
-                    # 检查并执行续约
                     renew_result = check_and_renew(page)
                     server_result["renew"]["needed"] = renew_result["need_renew"]
                     server_result["renew"]["done"] = renew_result["renewed"]
@@ -588,6 +661,9 @@ def main():
                             status_parts.append("✅续约成功")
                         else:
                             status_parts.append("❌续约失败")
+                    else:
+                        if renew_result.get("message"):
+                            status_parts.append(f"ℹ️{renew_result['message'][:20]}")
                     
                     if server_result["renew"]["expiration"]:
                         status_parts.append(f"📅{server_result['renew']['expiration']}")
@@ -604,7 +680,16 @@ def main():
                 
                 page.wait_for_timeout(2000)
             
-            # 9. 最终报告
+            # 7. 保存并更新 Cookie（放在最后）
+            log("INFO", "")
+            log("INFO", "🍪 保存并更新 Cookie...")
+            new_cookies = context.cookies()
+            new_cookie_str = save_cookies_for_update(new_cookies)
+            
+            if new_cookie_str:
+                update_github_secret("PANEL_BYTTE_COOKIES", new_cookie_str)
+            
+            # 8. 最终报告
             log("INFO", "")
             log("INFO", "=" * 50)
             log("INFO", "📊 执行完成")
