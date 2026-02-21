@@ -111,33 +111,6 @@ def parse_cookies(cookie_str: str) -> list:
     return cookies
 
 
-def notify_telegram(success: bool, title: str, message: str, image_path: str = None):
-    """发送 Telegram 通知"""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("WARN", "Telegram 未配置，跳过通知")
-        return
-    
-    emoji = "✅" if success else "❌"
-    text = f"{emoji} *{title}*\n\n{message}\n\n_Billing Kerit Auto Renewal_"
-    
-    try:
-        if image_path and Path(image_path).exists():
-            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
-            with open(image_path, "rb") as f:
-                files = {"photo": f}
-                data = {"chat_id": TG_CHAT_ID, "caption": text, "parse_mode": "Markdown"}
-                resp = requests.post(url, data=data, files=files, timeout=30)
-            if resp.status_code == 200:
-                log("INFO", "Telegram 图片已发送")
-            else:
-                log("WARN", f"Telegram 图片发送失败: {resp.text[:100]}")
-                send_text_only(text)
-        else:
-            send_text_only(text)
-    except Exception as e:
-        log("ERROR", f"Telegram 通知失败: {e}")
-
-
 def send_text_only(text: str):
     """仅发送文本消息"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -149,6 +122,45 @@ def send_text_only(text: str):
         log("INFO", "Telegram 消息已发送")
     except Exception as e:
         log("ERROR", f"发送文本失败: {e}")
+        
+
+def notify_telegram(success: bool, title: str, message: str, image_path: str = None):
+    """发送 Telegram 通知"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("WARN", "Telegram 未配置，跳过通知")
+        return
+    
+    emoji = "✅" if success else "❌"
+    text = f"{emoji} *{title}*\n\n{message}\n\n_Billing Kerit Auto Renewal_"
+    
+    try:
+        if image_path and Path(image_path).exists():
+            # 图片消息有 1024 字符限制，超长时分开发送
+            if len(text) > 1000:
+                # 先发图片（简短说明）
+                short_text = f"{emoji} *{title}*\n\n_详细信息见下条消息_"
+                url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+                with open(image_path, "rb") as f:
+                    files = {"photo": f}
+                    data = {"chat_id": TG_CHAT_ID, "caption": short_text, "parse_mode": "Markdown"}
+                    requests.post(url, data=data, files=files, timeout=30)
+                # 再发详细文本
+                send_text_only(text)
+            else:
+                url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+                with open(image_path, "rb") as f:
+                    files = {"photo": f}
+                    data = {"chat_id": TG_CHAT_ID, "caption": text, "parse_mode": "Markdown"}
+                    resp = requests.post(url, data=data, files=files, timeout=30)
+                if resp.status_code == 200:
+                    log("INFO", "Telegram 图片已发送")
+                else:
+                    log("WARN", f"Telegram 图片发送失败: {resp.text[:100]}")
+                    send_text_only(text)
+        else:
+            send_text_only(text)
+    except Exception as e:
+        log("ERROR", f"Telegram 通知失败: {e}")
 
 
 def update_github_secret(secret_name: str, secret_value: str):
@@ -623,7 +635,21 @@ def main():
                 
                 if not check_login_status(sb):
                     log("ERROR", "❌ 未登录，Cookie 可能已失效")
-                    notify_telegram(False, "登录失败", "Cookie 已失效，请手动更新", sp_session)
+                    
+                    cookie_help = (
+                        "Cookie 已失效，请手动更新\n\n"
+                        "📝 *Cookie 格式:*\n"
+                        "`session_id=值; cf_clearance=值`\n\n"
+                        "💡 *获取方式:*\n"
+                        "1. 浏览器登录 billing.kerit.cloud\n"
+                        "2. F12 → Application → Cookies\n"
+                        "3. 复制 `session_id` 和 `cf_clearance` 的值\n"
+                        "4. 更新 GitHub Secret: `BILLING_KERIT_COOKIES`\n\n"
+                        "⚠️ *注意:* 请使用与脚本相同的代理网络获取 Cookie，"
+                        "cf\\_clearance 与 IP 绑定"
+                    )
+                    
+                    notify_telegram(False, "登录失败", cookie_help, sp_session)
                     sys.exit(1)
                 
                 log("INFO", "✅ Cookie 有效，已登录")
