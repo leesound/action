@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zampto 自动续期脚本 - 优化版"""
+"""Zampto 自动续期脚本 - 修复版"""
 
 import os, sys, time, platform, requests, re
 import signal
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -17,6 +18,7 @@ OUTPUT_DIR = Path("output/screenshots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 CN_TZ = timezone(timedelta(hours=8))
+GLOBAL_TIMEOUT = 300  # 5分钟全局超时
 
 def cn_now() -> datetime:
     return datetime.now(CN_TZ)
@@ -86,13 +88,42 @@ def parse_accounts(s: str) -> List[Tuple[str, str]]:
     return [(p[0].strip(), p[1].strip()) for line in s.strip().split('\n') 
             if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
 
-class TimeoutError(Exception):
-    pass
+def safe_screenshot(sb, path: str, timeout: int = 10) -> bool:
+    """带超时的截图"""
+    try:
+        print(f"[DEBUG] 截图: {Path(path).name}")
+        sb.save_screenshot(path)
+        print(f"[DEBUG] 截图完成")
+        return True
+    except Exception as e:
+        print(f"[WARN] 截图失败: {e}")
+        return False
 
-def timeout_handler(signum, frame):
-    raise TimeoutError("操作超时")
+def safe_open(sb, url: str, timeout: int = 30) -> bool:
+    """带超时的页面打开"""
+    try:
+        print(f"[DEBUG] 打开: {url[:50]}...")
+        sb.set_page_load_timeout(timeout)
+        sb.open(url)
+        print(f"[DEBUG] 页面已打开")
+        return True
+    except Exception as e:
+        print(f"[WARN] 打开页面超时/失败: {e}")
+        try:
+            sb.execute_script("window.stop();")
+        except:
+            pass
+        return False
 
-def wait_turnstile(sb, wait: int = 90) -> bool:
+def safe_execute_script(sb, script: str, timeout: int = 10, default=None):
+    """带超时的 JS 执行"""
+    try:
+        return sb.execute_script(script)
+    except Exception as e:
+        print(f"[WARN] JS 执行失败: {e}")
+        return default
+
+def wait_turnstile(sb, wait: int = 60) -> bool:
     """等待 Turnstile 验证完成"""
     print("[INFO] 等待 Turnstile 验证...")
     start = time.time()
@@ -100,29 +131,15 @@ def wait_turnstile(sb, wait: int = 90) -> bool:
     for i in range(wait):
         elapsed = int(time.time() - start)
         try:
-            # 检查验证是否完成
-            result = sb.execute_script('''
+            result = safe_execute_script(sb, '''
                 (function() {
-                    // 检查 cf-turnstile-response
                     var cf = document.querySelector("input[name='cf-turnstile-response']");
                     if (cf && cf.value && cf.value.length > 20) return "done";
-                    
-                    // 检查成功消息
                     var body = document.body.innerText || "";
-                    if (body.includes("renewed successfully") || 
-                        body.includes("Renewal successful") ||
-                        body.includes("成功")) return "success_msg";
-                    
-                    // 检查是否有验证框
-                    var iframe = document.querySelector('iframe[src*="turnstile"]');
-                    if (iframe) return "has_iframe";
-                    
-                    var widget = document.querySelector('.cf-turnstile');
-                    if (widget) return "has_widget";
-                    
+                    if (body.includes("renewed successfully") || body.includes("Renewal successful")) return "success_msg";
                     return "waiting";
                 })()
-            ''')
+            ''', timeout=5, default="error")
             
             if result == "done":
                 print(f"[INFO] ✅ Turnstile 验证完成 ({elapsed}s)")
@@ -131,12 +148,11 @@ def wait_turnstile(sb, wait: int = 90) -> bool:
                 print(f"[INFO] ✅ 检测到成功消息 ({elapsed}s)")
                 return True
             
-            if i % 10 == 0 and i > 0:
-                print(f"[INFO] 验证等待中... {elapsed}s (状态: {result})")
+            if i % 15 == 0 and i > 0:
+                print(f"[INFO] 验证等待中... {elapsed}s")
                 
         except Exception as e:
-            if i % 20 == 0:
-                print(f"[WARN] 检查验证状态出错: {e}")
+            pass
         
         time.sleep(1)
     
@@ -147,96 +163,50 @@ def try_click_turnstile(sb, idx: int) -> bool:
     """尝试点击 Turnstile 验证"""
     print("[INFO] 尝试处理 Turnstile...")
     
-    # 方法1: 使用 JavaScript 点击 iframe 内的复选框
+    # 方法1: JS 点击
     try:
-        clicked = sb.execute_script('''
+        clicked = safe_execute_script(sb, '''
             (function() {
-                // 尝试找到并点击 turnstile iframe
                 var iframes = document.querySelectorAll('iframe');
                 for (var i = 0; i < iframes.length; i++) {
                     var src = iframes[i].src || "";
                     if (src.includes("turnstile") || src.includes("challenges")) {
-                        // 尝试点击 iframe 区域
-                        var rect = iframes[i].getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            iframes[i].click();
-                            return "clicked_iframe";
-                        }
+                        iframes[i].click();
+                        return "clicked_iframe";
                     }
                 }
-                
-                // 尝试点击 cf-turnstile 容器
                 var widget = document.querySelector('.cf-turnstile');
-                if (widget) {
-                    widget.click();
-                    return "clicked_widget";
-                }
-                
+                if (widget) { widget.click(); return "clicked_widget"; }
                 return "no_target";
             })()
-        ''')
+        ''', timeout=5, default="error")
         print(f"[INFO] JS 点击结果: {clicked}")
     except Exception as e:
         print(f"[WARN] JS 点击失败: {e}")
     
     time.sleep(2)
     
-    # 方法2: 使用 SeleniumBase 的 uc_gui_click_captcha（带超时）
+    # 方法2: uc_gui_click_captcha（带超时，仅 Linux）
     if is_linux():
-        try:
-            print("[INFO] 尝试 uc_gui_click_captcha (最多30秒)...")
-            
-            # 设置超时
-            if hasattr(signal, 'SIGALRM'):
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(30)
-            
+        print("[INFO] 尝试 uc_gui_click_captcha (最多20秒)...")
+        
+        def click_captcha():
             try:
                 sb.uc_gui_click_captcha()
-                print("[INFO] uc_gui_click_captcha 完成")
-            except TimeoutError:
-                print("[WARN] uc_gui_click_captcha 超时")
-            finally:
-                if hasattr(signal, 'SIGALRM'):
-                    signal.alarm(0)
-                    
-        except Exception as e:
-            print(f"[WARN] uc_gui_click_captcha 失败: {e}")
+            except:
+                pass
+        
+        thread = threading.Thread(target=click_captcha)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=20)
+        
+        if thread.is_alive():
+            print("[WARN] uc_gui_click_captcha 超时，继续...")
+        else:
+            print("[INFO] uc_gui_click_captcha 完成")
     
     time.sleep(2)
-    
-    # 方法3: 切换到 iframe 并点击
-    try:
-        iframes = sb.find_elements('iframe')
-        for iframe in iframes:
-            src = iframe.get_attribute('src') or ""
-            if 'turnstile' in src or 'challenge' in src:
-                print("[INFO] 找到 Turnstile iframe，尝试切换...")
-                sb.switch_to_frame(iframe)
-                time.sleep(1)
-                
-                # 尝试点击复选框
-                try:
-                    sb.click('input[type="checkbox"]')
-                    print("[INFO] 点击了 iframe 内复选框")
-                except:
-                    try:
-                        sb.click('div')
-                        print("[INFO] 点击了 iframe 内 div")
-                    except:
-                        pass
-                
-                sb.switch_to_default_content()
-                break
-    except Exception as e:
-        print(f"[WARN] iframe 处理失败: {e}")
-        try:
-            sb.switch_to_default_content()
-        except:
-            pass
-    
-    time.sleep(2)
-    sb.save_screenshot(shot(idx, "turnstile-after"))
     return True
 
 def login(sb, user: str, pwd: str, idx: int) -> bool:
@@ -246,7 +216,8 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
     for attempt in range(3):
         try:
             print(f"[INFO] 打开登录页 (尝试 {attempt + 1}/3)...")
-            sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=10.0)
+            sb.set_page_load_timeout(30)
+            sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=8.0)
             time.sleep(5)
             
             current_url = sb.get_current_url()
@@ -254,7 +225,7 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 print("[INFO] ✅ 已登录")
                 return True
             
-            sb.save_screenshot(shot(idx, f"01-login-{attempt}"))
+            safe_screenshot(sb, shot(idx, f"01-login-{attempt}"))
             
             for _ in range(10):
                 src = sb.get_page_source()
@@ -262,12 +233,7 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                     break
                 time.sleep(2)
             
-            selectors = [
-                'input[name="identifier"]',
-                'input[type="email"]',
-                'input[type="text"]',
-                '#identifier'
-            ]
+            selectors = ['input[name="identifier"]', 'input[type="email"]', 'input[type="text"]']
             
             input_found = False
             for sel in selectors:
@@ -323,7 +289,7 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 sb.click('button')
             
             time.sleep(6)
-            sb.save_screenshot(shot(idx, "02-result"))
+            safe_screenshot(sb, shot(idx, "02-result"))
             
             current_url = sb.get_current_url()
             if "dash.zampto.net" in current_url or "sign-in" not in current_url:
@@ -355,9 +321,9 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     servers = []
     seen_ids = set()
     
-    sb.open(DASHBOARD_URL)
+    safe_open(sb, DASHBOARD_URL, timeout=30)
     time.sleep(5)
-    sb.save_screenshot(shot(idx, "03-dashboard"))
+    safe_screenshot(sb, shot(idx, "03-dashboard"))
     
     src = sb.get_page_source()
     if "Access Blocked" in src or "VPN or Proxy Detected" in src:
@@ -366,7 +332,7 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     
     for page_url in [DASHBOARD_URL, OVERVIEW_URL]:
         if page_url != DASHBOARD_URL:
-            sb.open(page_url)
+            safe_open(sb, page_url, timeout=30)
             time.sleep(3)
         
         src = sb.get_page_source()
@@ -387,7 +353,7 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
               "old_time": "", "new_time": "", "old_time_cn": "", "new_time_cn": "", "expiry_cn": ""}
     print(f"[INFO] 续期服务器 {sid_masked}...")
     
-    sb.open(SERVER_URL.format(sid))
+    safe_open(sb, SERVER_URL.format(sid), timeout=30)
     time.sleep(4)
     
     src = sb.get_page_source()
@@ -396,84 +362,76 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         return result
     
     # 获取续期前时间
-    old_renewal = ""
-    try:
-        old_renewal = sb.execute_script('''
-            var el = document.getElementById("lastRenewalTime");
-            return el ? el.textContent.trim() : "";
-        ''')
-    except: pass
+    old_renewal = safe_execute_script(sb, '''
+        var el = document.getElementById("lastRenewalTime");
+        return el ? el.textContent.trim() : "";
+    ''', default="") or ""
     
     result["old_time"] = old_renewal
     result["old_time_cn"] = parse_renewal_time(old_renewal)
     print(f"[INFO] 续期前时间: {old_renewal}")
     
     # 点击续期按钮
-    try:
-        clicked = sb.execute_script(f'''
-            (function() {{
-                var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
-                for (var i = 0; i < links.length; i++) {{
-                    if (links[i].getAttribute('onclick').includes('{sid}')) {{
-                        links[i].click();
-                        return true;
-                    }}
+    print("[INFO] 点击续期按钮...")
+    clicked = safe_execute_script(sb, f'''
+        (function() {{
+            var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
+            for (var i = 0; i < links.length; i++) {{
+                if (links[i].getAttribute('onclick').includes('{sid}')) {{
+                    links[i].click();
+                    return true;
                 }}
-                var btns = document.querySelectorAll('a.action-button, button');
-                for (var i = 0; i < btns.length; i++) {{
-                    if (btns[i].textContent.toLowerCase().includes('renew')) {{
-                        btns[i].click();
-                        return true;
-                    }}
+            }}
+            var btns = document.querySelectorAll('a.action-button, button');
+            for (var i = 0; i < btns.length; i++) {{
+                if (btns[i].textContent.toLowerCase().includes('renew')) {{
+                    btns[i].click();
+                    return true;
                 }}
-                return false;
-            }})()
-        ''')
-        
-        if not clicked:
-            result["message"] = "未找到续期按钮"
-            sb.save_screenshot(shot(idx, f"srv-{sid}-nobtn"))
-            return result
-            
-    except Exception as e:
-        result["message"] = f"点击失败: {e}"
+            }}
+            return false;
+        }})()
+    ''', default=False)
+    
+    if not clicked:
+        result["message"] = "未找到续期按钮"
+        safe_screenshot(sb, shot(idx, f"srv-{sid}-nobtn"))
         return result
     
     print("[INFO] 已点击续期按钮")
     time.sleep(3)
-    sb.save_screenshot(shot(idx, f"srv-{sid}-clicked"))
+    safe_screenshot(sb, shot(idx, f"srv-{sid}-clicked"))
     
     # 处理 Turnstile 验证
     try_click_turnstile(sb, idx)
     
     # 等待验证完成
-    turnstile_ok = wait_turnstile(sb, 90)
+    print("[INFO] 开始等待验证结果...")
+    wait_turnstile(sb, 60)
     
-    if not turnstile_ok:
-        print("[WARN] Turnstile 可能未完成，继续检查结果...")
-    
+    print("[INFO] 验证等待结束，等待3秒...")
     time.sleep(3)
     
+    print("[INFO] 准备截图...")
     sp = shot(idx, f"srv-{sid}")
-    sb.save_screenshot(sp)
+    safe_screenshot(sb, sp)
     result["screenshot"] = sp
     
     # 重新加载页面检查结果
-    sb.open(SERVER_URL.format(sid))
+    print("[INFO] 重新加载服务器页面...")
+    safe_open(sb, SERVER_URL.format(sid), timeout=30)
     time.sleep(4)
     
-    new_renewal = ""
-    remain = ""
-    try:
-        new_renewal = sb.execute_script('''
-            var el = document.getElementById("lastRenewalTime");
-            return el ? el.textContent.trim() : "";
-        ''')
-        remain = sb.execute_script('''
-            var el = document.getElementById("nextRenewalTime");
-            return el ? el.textContent.trim() : "";
-        ''')
-    except: pass
+    print("[INFO] 获取续期后时间...")
+    new_renewal = safe_execute_script(sb, '''
+        var el = document.getElementById("lastRenewalTime");
+        return el ? el.textContent.trim() : "";
+    ''', default="") or ""
+    
+    remain = safe_execute_script(sb, '''
+        var el = document.getElementById("nextRenewalTime");
+        return el ? el.textContent.trim() : "";
+    ''', default="") or ""
     
     result["new_time"] = new_renewal
     result["new_time_cn"] = parse_renewal_time(new_renewal)
@@ -494,8 +452,9 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     else:
         result["message"] = f"状态未知 | {result['new_time_cn']}"
     
+    print("[INFO] 保存结果截图...")
     result_shot = shot(idx, f"srv-{sid}-result")
-    sb.save_screenshot(result_shot)
+    safe_screenshot(sb, result_shot)
     result["screenshot"] = result_shot
     
     print(f"[INFO] {'✅' if result['success'] else '⚠️'} {result['message']}")
@@ -528,10 +487,11 @@ def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
     result["success"] = ok > 0
     result["message"] = f"{ok}/{len(result['servers'])} 成功"
     
-    sb.open(DASHBOARD_URL)
+    print("[INFO] 保存最终截图...")
+    safe_open(sb, DASHBOARD_URL, timeout=30)
     time.sleep(2)
     final_shot = shot(idx, "05-final")
-    sb.save_screenshot(final_shot)
+    safe_screenshot(sb, final_shot)
     result["final_screenshot"] = final_shot
     
     logout(sb)
@@ -568,6 +528,13 @@ def main():
             print("[INFO] 使用代理模式")
         
         with SB(**opts) as sb:
+            # 设置各种超时
+            try:
+                sb.set_page_load_timeout(60)
+                sb.driver.set_script_timeout(30)
+            except:
+                pass
+            
             for i, (u, p) in enumerate(accounts, 1):
                 try:
                     r = process(sb, u, p, i)
