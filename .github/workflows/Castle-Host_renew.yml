@@ -1,7 +1,7 @@
 name: Castle HOST 续约
 on:
   schedule:
-    - cron: '45 30 * * *'  # 每天北京时间 01:00 运行
+    - cron: '45 3 * * *'  # 每天北京时间 11:45 运行
   workflow_dispatch:      # 支持手动触发
 jobs:
   add_time:
