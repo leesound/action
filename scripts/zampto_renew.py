@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zampto 自动续期脚本 - 修复版"""
+"""Zampto 自动续期脚本 - 修复事件循环版"""
 
 import os, sys, time, platform, requests, re
-import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -86,114 +85,6 @@ def parse_accounts(s: str) -> List[Tuple[str, str]]:
     return [(p[0].strip(), p[1].strip()) for line in s.strip().split('\n') 
             if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
 
-def safe_screenshot(sb, path: str) -> bool:
-    """带异常捕获的截图"""
-    try:
-        print(f"[DEBUG] 截图: {Path(path).name}")
-        sb.save_screenshot(path)
-        return True
-    except Exception as e:
-        print(f"[WARN] 截图失败: {e}")
-        return False
-
-def safe_open(sb, url: str) -> bool:
-    """带异常捕获的页面打开"""
-    try:
-        print(f"[DEBUG] 打开: {url[:50]}...")
-        sb.open(url)
-        return True
-    except Exception as e:
-        print(f"[WARN] 打开页面失败: {e}")
-        return False
-
-def safe_js(sb, script: str, default=None):
-    """带异常捕获的 JS 执行"""
-    try:
-        return sb.execute_script(script)
-    except Exception as e:
-        print(f"[WARN] JS 执行失败: {e}")
-        return default
-
-def wait_turnstile(sb, wait: int = 60) -> bool:
-    """等待 Turnstile 验证完成"""
-    print("[INFO] 等待 Turnstile 验证...")
-    
-    for i in range(wait):
-        try:
-            result = safe_js(sb, '''
-                (function() {
-                    var cf = document.querySelector("input[name='cf-turnstile-response']");
-                    if (cf && cf.value && cf.value.length > 20) return "done";
-                    var body = document.body.innerText || "";
-                    if (body.includes("renewed successfully") || body.includes("Renewal successful")) return "success_msg";
-                    return "waiting";
-                })()
-            ''', default="error")
-            
-            if result == "done":
-                print(f"[INFO] ✅ Turnstile 验证完成 ({i}s)")
-                return True
-            elif result == "success_msg":
-                print(f"[INFO] ✅ 检测到成功消息 ({i}s)")
-                return True
-            
-            if i % 15 == 0 and i > 0:
-                print(f"[INFO] 验证等待中... {i}s")
-                
-        except:
-            pass
-        
-        time.sleep(1)
-    
-    print(f"[WARN] Turnstile 等待超时 ({wait}s)")
-    return False
-
-def try_click_turnstile(sb, idx: int):
-    """尝试点击 Turnstile 验证"""
-    print("[INFO] 尝试处理 Turnstile...")
-    
-    # JS 点击
-    clicked = safe_js(sb, '''
-        (function() {
-            var iframes = document.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-                var src = iframes[i].src || "";
-                if (src.includes("turnstile") || src.includes("challenges")) {
-                    iframes[i].click();
-                    return "clicked_iframe";
-                }
-            }
-            var widget = document.querySelector('.cf-turnstile');
-            if (widget) { widget.click(); return "clicked_widget"; }
-            return "no_target";
-        })()
-    ''', default="error")
-    print(f"[INFO] JS 点击结果: {clicked}")
-    
-    time.sleep(2)
-    
-    # uc_gui_click_captcha（带线程超时）
-    if is_linux():
-        print("[INFO] 尝试 uc_gui_click_captcha (最多20秒)...")
-        
-        def click_captcha():
-            try:
-                sb.uc_gui_click_captcha()
-            except:
-                pass
-        
-        thread = threading.Thread(target=click_captcha)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout=20)
-        
-        if thread.is_alive():
-            print("[WARN] uc_gui_click_captcha 超时，继续...")
-        else:
-            print("[INFO] uc_gui_click_captcha 完成")
-    
-    time.sleep(2)
-
 def login(sb, user: str, pwd: str, idx: int) -> bool:
     user_masked = mask(user)
     print(f"\n{'='*50}\n[INFO] 账号 {idx}: 登录 {user_masked}\n{'='*50}")
@@ -209,7 +100,7 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 print("[INFO] ✅ 已登录")
                 return True
             
-            safe_screenshot(sb, shot(idx, f"01-login-{attempt}"))
+            sb.save_screenshot(shot(idx, f"01-login-{attempt}"))
             
             for _ in range(10):
                 src = sb.get_page_source()
@@ -273,7 +164,7 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 sb.click('button')
             
             time.sleep(6)
-            safe_screenshot(sb, shot(idx, "02-result"))
+            sb.save_screenshot(shot(idx, "02-result"))
             
             current_url = sb.get_current_url()
             if "dash.zampto.net" in current_url or "sign-in" not in current_url:
@@ -305,9 +196,9 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     servers = []
     seen_ids = set()
     
-    safe_open(sb, DASHBOARD_URL)
+    sb.open(DASHBOARD_URL)
     time.sleep(5)
-    safe_screenshot(sb, shot(idx, "03-dashboard"))
+    sb.save_screenshot(shot(idx, "03-dashboard"))
     
     src = sb.get_page_source()
     if "Access Blocked" in src or "VPN or Proxy Detected" in src:
@@ -316,7 +207,7 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
     
     for page_url in [DASHBOARD_URL, OVERVIEW_URL]:
         if page_url != DASHBOARD_URL:
-            safe_open(sb, page_url)
+            sb.open(page_url)
             time.sleep(3)
         
         src = sb.get_page_source()
@@ -331,91 +222,71 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
         print(f"  - ID: {mask(s['id'])}")
     return servers
 
-def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
-    sid_masked = mask(sid)
-    result = {"server_id": sid, "success": False, "message": "", "screenshot": None, 
-              "old_time": "", "new_time": "", "old_time_cn": "", "new_time_cn": "", "expiry_cn": ""}
-    print(f"[INFO] 续期服务器 {sid_masked}...")
+def handle_turnstile(sb, idx: int) -> bool:
+    """处理 Turnstile 验证 - 串行执行，不用线程"""
+    print("[INFO] 处理 Turnstile 验证...")
     
-    safe_open(sb, SERVER_URL.format(sid))
-    time.sleep(4)
-    
-    src = sb.get_page_source()
-    if "Access Blocked" in src:
-        result["message"] = "访问被阻止"
-        return result
-    
-    # 获取续期前时间
-    old_renewal = safe_js(sb, '''
-        var el = document.getElementById("lastRenewalTime");
-        return el ? el.textContent.trim() : "";
-    ''', default="") or ""
-    
-    result["old_time"] = old_renewal
-    result["old_time_cn"] = parse_renewal_time(old_renewal)
-    print(f"[INFO] 续期前时间: {old_renewal}")
-    
-    # 点击续期按钮
-    print("[INFO] 点击续期按钮...")
-    clicked = safe_js(sb, f'''
-        (function() {{
-            var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
-            for (var i = 0; i < links.length; i++) {{
-                if (links[i].getAttribute('onclick').includes('{sid}')) {{
-                    links[i].click();
-                    return true;
-                }}
-            }}
-            var btns = document.querySelectorAll('a.action-button, button');
-            for (var i = 0; i < btns.length; i++) {{
-                if (btns[i].textContent.toLowerCase().includes('renew')) {{
-                    btns[i].click();
-                    return true;
-                }}
-            }}
-            return false;
-        }})()
-    ''', default=False)
-    
-    if not clicked:
-        result["message"] = "未找到续期按钮"
-        safe_screenshot(sb, shot(idx, f"srv-{sid}-nobtn"))
-        return result
-    
-    print("[INFO] 已点击续期按钮")
+    # 等待模态框和 Turnstile 加载
     time.sleep(3)
-    safe_screenshot(sb, shot(idx, f"srv-{sid}-clicked"))
     
-    # 处理 Turnstile 验证
-    try_click_turnstile(sb, idx)
+    # 方法1: 尝试 uc_gui_click_captcha（仅 Linux）
+    if is_linux():
+        print("[INFO] 尝试 uc_gui_click_captcha...")
+        try:
+            sb.uc_gui_click_captcha()
+            print("[INFO] uc_gui_click_captcha 完成")
+        except Exception as e:
+            print(f"[WARN] uc_gui_click_captcha 失败: {e}")
+    
+    # 方法2: 尝试 JS 点击 iframe
+    print("[INFO] 尝试 JS 点击...")
+    try:
+        sb.execute_script('''
+            (function() {
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || "";
+                    if (src.includes("turnstile") || src.includes("challenges")) {
+                        iframes[i].click();
+                        return;
+                    }
+                }
+                var widget = document.querySelector('.cf-turnstile');
+                if (widget) widget.click();
+            })()
+        ''')
+    except Exception as e:
+        print(f"[WARN] JS 点击失败: {e}")
     
     # 等待验证完成
-    print("[INFO] 开始等待验证结果...")
-    wait_turnstile(sb, 60)
+    print("[INFO] 等待验证完成...")
+    time.sleep(10)
     
-    print("[INFO] 验证等待结束")
-    time.sleep(3)
+    return True
+
+def check_renewal_success(sb, old_time: str, sid: str) -> Dict[str, Any]:
+    """检查续期是否成功"""
+    result = {"success": False, "new_time": "", "message": ""}
     
-    print("[INFO] 截图...")
-    sp = shot(idx, f"srv-{sid}")
-    safe_screenshot(sb, sp)
-    result["screenshot"] = sp
-    
-    # 重新加载页面检查结果
-    print("[INFO] 重新加载服务器页面...")
-    safe_open(sb, SERVER_URL.format(sid))
+    # 重新加载页面
+    sb.open(SERVER_URL.format(sid))
     time.sleep(4)
     
-    print("[INFO] 获取续期后时间...")
-    new_renewal = safe_js(sb, '''
-        var el = document.getElementById("lastRenewalTime");
-        return el ? el.textContent.trim() : "";
-    ''', default="") or ""
+    try:
+        new_renewal = sb.execute_script('''
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
+    except:
+        new_renewal = ""
     
-    remain = safe_js(sb, '''
-        var el = document.getElementById("nextRenewalTime");
-        return el ? el.textContent.trim() : "";
-    ''', default="") or ""
+    try:
+        remain = sb.execute_script('''
+            var el = document.getElementById("nextRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
+    except:
+        remain = ""
     
     result["new_time"] = new_renewal
     result["new_time_cn"] = parse_renewal_time(new_renewal)
@@ -424,21 +295,129 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
     
     today = datetime.now().strftime('%b %d, %Y')
-    if new_renewal and new_renewal != old_renewal:
+    if new_renewal and new_renewal != old_time:
         result["success"] = True
-        result["message"] = f"{result['old_time_cn']} -> {result['expiry_cn']}"
+        result["message"] = f"时间已更新"
     elif today in str(new_renewal):
         result["success"] = True
-        result["message"] = f"今日已续期 | {result['new_time_cn']} -> {result['expiry_cn']}"
+        result["message"] = f"今日已续期"
     elif remain and ("1 day" in remain or "2 day" in remain or "hour" in remain):
         result["success"] = True
-        result["message"] = f"{result['new_time_cn']} -> {result['expiry_cn']}"
-    else:
-        result["message"] = f"状态未知 | {result['new_time_cn']}"
+        result["message"] = f"剩余时间正常"
     
-    print("[INFO] 保存结果截图...")
+    return result
+
+def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
+    sid_masked = mask(sid)
+    result = {"server_id": sid, "success": False, "message": "", "screenshot": None, 
+              "old_time": "", "new_time": "", "old_time_cn": "", "new_time_cn": "", "expiry_cn": ""}
+    print(f"[INFO] 续期服务器 {sid_masked}...")
+    
+    sb.open(SERVER_URL.format(sid))
+    time.sleep(4)
+    
+    src = sb.get_page_source()
+    if "Access Blocked" in src:
+        result["message"] = "访问被阻止"
+        return result
+    
+    # 获取续期前时间
+    try:
+        old_renewal = sb.execute_script('''
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
+    except:
+        old_renewal = ""
+    
+    result["old_time"] = old_renewal
+    result["old_time_cn"] = parse_renewal_time(old_renewal)
+    print(f"[INFO] 续期前时间: {old_renewal}")
+    
+    # 点击续期按钮
+    print("[INFO] 点击续期按钮...")
+    try:
+        clicked = sb.execute_script(f'''
+            (function() {{
+                var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
+                for (var i = 0; i < links.length; i++) {{
+                    if (links[i].getAttribute('onclick').includes('{sid}')) {{
+                        links[i].click();
+                        return true;
+                    }}
+                }}
+                var btns = document.querySelectorAll('a.action-button, button');
+                for (var i = 0; i < btns.length; i++) {{
+                    if (btns[i].textContent.toLowerCase().includes('renew')) {{
+                        btns[i].click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        ''')
+    except:
+        clicked = False
+    
+    if not clicked:
+        result["message"] = "未找到续期按钮"
+        sb.save_screenshot(shot(idx, f"srv-{sid}-nobtn"))
+        return result
+    
+    print("[INFO] 已点击续期按钮")
+    time.sleep(2)
+    sb.save_screenshot(shot(idx, f"srv-{sid}-clicked"))
+    
+    # 处理 Turnstile（串行，不用线程）
+    handle_turnstile(sb, idx)
+    
+    sb.save_screenshot(shot(idx, f"srv-{sid}-after"))
+    
+    # 检查结果
+    check = check_renewal_success(sb, old_renewal, sid)
+    result["new_time"] = check.get("new_time", "")
+    result["new_time_cn"] = check.get("new_time_cn", "")
+    result["expiry_cn"] = check.get("expiry_cn", "")
+    
+    if check["success"]:
+        result["success"] = True
+        result["message"] = f"{result['old_time_cn']} -> {result['expiry_cn']}"
+    else:
+        # 如果第一次没成功，再尝试一次
+        print("[INFO] 第一次检查未成功，再次尝试...")
+        sb.open(SERVER_URL.format(sid))
+        time.sleep(3)
+        
+        # 再次点击续期
+        try:
+            sb.execute_script(f'''
+                var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
+                for (var i = 0; i < links.length; i++) {{
+                    if (links[i].getAttribute('onclick').includes('{sid}')) {{
+                        links[i].click();
+                    }}
+                }}
+            ''')
+        except:
+            pass
+        
+        time.sleep(2)
+        handle_turnstile(sb, idx)
+        
+        # 再次检查
+        check = check_renewal_success(sb, old_renewal, sid)
+        result["new_time"] = check.get("new_time", "")
+        result["new_time_cn"] = check.get("new_time_cn", "")
+        result["expiry_cn"] = check.get("expiry_cn", "")
+        
+        if check["success"]:
+            result["success"] = True
+            result["message"] = f"{result['old_time_cn']} -> {result['expiry_cn']}"
+        else:
+            result["message"] = f"状态未知 | {result['new_time_cn']}"
+    
     result_shot = shot(idx, f"srv-{sid}-result")
-    safe_screenshot(sb, result_shot)
+    sb.save_screenshot(result_shot)
     result["screenshot"] = result_shot
     
     print(f"[INFO] {'✅' if result['success'] else '⚠️'} {result['message']}")
@@ -471,11 +450,10 @@ def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
     result["success"] = ok > 0
     result["message"] = f"{ok}/{len(result['servers'])} 成功"
     
-    print("[INFO] 保存最终截图...")
-    safe_open(sb, DASHBOARD_URL)
+    sb.open(DASHBOARD_URL)
     time.sleep(2)
     final_shot = shot(idx, "05-final")
-    safe_screenshot(sb, final_shot)
+    sb.save_screenshot(final_shot)
     result["final_screenshot"] = final_shot
     
     logout(sb)
