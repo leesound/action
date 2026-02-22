@@ -86,39 +86,23 @@ def parse_accounts(s: str) -> List[Tuple[str, str]]:
             if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
 
 def detect_turnstile_type(sb) -> str:
-    """检测 Turnstile 类型: 'invisible', 'visible', 'none'"""
+    """检测 Turnstile 类型"""
     try:
         result = sb.execute_script('''
             (function() {
-                // 检查是否有 turnstile response 字段
                 var cf = document.querySelector("input[name='cf-turnstile-response']");
                 if (!cf) return "none";
                 
-                // 检查是否有可见的 iframe（visible turnstile 特征）
                 var iframes = document.querySelectorAll('iframe');
                 for (var i = 0; i < iframes.length; i++) {
                     var src = iframes[i].src || "";
                     if (src.includes("turnstile") || src.includes("challenges.cloudflare")) {
                         var rect = iframes[i].getBoundingClientRect();
-                        // 如果 iframe 可见且有一定大小，是 visible 类型
                         if (rect.width > 50 && rect.height > 50) {
                             return "visible";
                         }
                     }
                 }
-                
-                // 检查 cf-turnstile widget
-                var widget = document.querySelector('.cf-turnstile, [data-sitekey]');
-                if (widget) {
-                    var rect = widget.getBoundingClientRect();
-                    if (rect.width > 50 && rect.height > 50) {
-                        // 检查内部是否有可见的复选框
-                        var checkbox = widget.querySelector('input[type="checkbox"]');
-                        if (checkbox) return "visible";
-                    }
-                }
-                
-                // 有 response 字段但没有可见的复选框，是 invisible 类型
                 return "invisible";
             })()
         ''')
@@ -126,38 +110,61 @@ def detect_turnstile_type(sb) -> str:
     except:
         return "unknown"
 
-def wait_turnstile_token(sb, timeout: int = 60) -> bool:
-    """等待 Turnstile token 自动填充（用于 Invisible 模式）"""
-    print(f"[INFO] 等待 Turnstile token (最多 {timeout}s)...")
+def wait_turnstile_complete(sb, timeout: int = 60) -> str:
+    """
+    等待 Turnstile 完成
+    返回: "token" (获取到token), "closed" (modal消失/页面刷新), "timeout" (超时)
+    """
+    print(f"[INFO] 等待验证完成 (最多 {timeout}s)...")
     
     for i in range(timeout):
         try:
             result = sb.execute_script('''
                 (function() {
+                    // 检查 modal 是否还存在
+                    var modal = document.querySelector('.confirmation-modal-content');
+                    var turnstileContainer = document.getElementById('turnstileContainer');
+                    
+                    // 如果 modal 消失了，说明验证完成并提交了
+                    if (!modal && !turnstileContainer) {
+                        return "closed";
+                    }
+                    
+                    // 检查是否获取到 token
                     var inputs = document.querySelectorAll("input[name='cf-turnstile-response']");
                     for (var j = 0; j < inputs.length; j++) {
                         if (inputs[j].value && inputs[j].value.length > 20) {
-                            return "done";
+                            return "token";
                         }
                     }
-                    return null;
+                    
+                    // modal 还在，继续等待
+                    return "waiting";
                 })()
             ''')
-            if result == "done":
+            
+            if result == "closed":
+                print(f"[INFO] ✅ 验证完成，页面已刷新 ({i}s)")
+                return "closed"
+            elif result == "token":
                 print(f"[INFO] ✅ Token 已获取 ({i}s)")
-                return True
-        except: pass
+                return "token"
+                
+        except Exception as e:
+            # 如果执行出错，可能是页面正在刷新
+            print(f"[INFO] ✅ 页面刷新中 ({i}s)")
+            return "closed"
         
         if i % 15 == 0 and i:
-            print(f"[INFO] 等待 token... {i}s")
+            print(f"[INFO] 等待验证... {i}s")
         time.sleep(1)
     
-    print(f"[WARN] Token 获取超时 ({timeout}s)")
-    return False
+    print(f"[WARN] 验证超时 ({timeout}s)")
+    return "timeout"
 
 def handle_turnstile(sb, idx: int) -> bool:
-    """智能处理 Turnstile - 根据类型选择方法"""
-    time.sleep(2)  # 等待 turnstile 加载
+    """智能处理 Turnstile"""
+    time.sleep(2)
     
     turnstile_type = detect_turnstile_type(sb)
     print(f"[INFO] Turnstile 类型: {turnstile_type}")
@@ -167,11 +174,11 @@ def handle_turnstile(sb, idx: int) -> bool:
         return True
     
     if turnstile_type == "invisible":
-        # Invisible 模式：只等待 token 自动填充，不点击
         print("[INFO] Invisible Turnstile - 等待自动验证...")
-        return wait_turnstile_token(sb, 60)
+        result = wait_turnstile_complete(sb, 45)
+        return result in ("token", "closed")
     
-    # Visible 模式：尝试点击
+    # Visible 模式
     print("[INFO] Visible Turnstile - 尝试点击...")
     try:
         sb.uc_gui_click_captcha()
@@ -179,28 +186,8 @@ def handle_turnstile(sb, idx: int) -> bool:
     except Exception as e:
         print(f"[WARN] uc_gui_click_captcha 失败: {e}")
     
-    # 等待验证完成
-    return wait_turnstile_token(sb, 60)
-
-def wait_turnstile(sb, wait: int = 60) -> bool:
-    """等待 Turnstile 完成（兼容旧逻辑）"""
-    print("[INFO] 等待 Turnstile...")
-    for i in range(wait):
-        try:
-            result = sb.execute_script('''
-                (function() {
-                    var cf = document.querySelector("input[name='cf-turnstile-response']");
-                    if (cf && cf.value && cf.value.length > 20) return "done";
-                    return null;
-                })()
-            ''')
-            if result == "done":
-                print("[INFO] ✅ Turnstile 完成")
-                return True
-        except: pass
-        if i % 15 == 0 and i: print(f"[INFO] 等待验证... {i}s")
-        time.sleep(1)
-    return False
+    result = wait_turnstile_complete(sb, 45)
+    return result in ("token", "closed")
 
 def login(sb, user: str, pwd: str, idx: int) -> bool:
     user_masked = mask(user)
@@ -230,8 +217,6 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 'input[type="email"]',
                 'input[type="text"]',
                 '#identifier',
-                'input[placeholder*="email" i]',
-                'input[placeholder*="user" i]'
             ]
             
             input_found = False
@@ -252,29 +237,18 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 if attempt < 2:
                     time.sleep(5)
                     continue
-                else:
-                    print("[ERROR] 未找到登录表单")
-                    return False
+                return False
             
             try:
                 sb.click('button[type="submit"]')
             except:
-                try:
-                    sb.click('button')
-                except:
-                    pass
+                sb.click('button')
             
             time.sleep(4)
             
-            pwd_selectors = [
-                'input[name="password"]',
-                'input[type="password"]',
-                '#password'
-            ]
-            
             pwd_found = False
             for _ in range(15):
-                for sel in pwd_selectors:
+                for sel in ['input[name="password"]', 'input[type="password"]']:
                     try:
                         if sb.is_element_visible(sel):
                             sb.type(sel, pwd)
@@ -289,20 +263,15 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
             
             if not pwd_found:
                 print("[WARN] 密码页面未加载")
-                sb.save_screenshot(shot(idx, f"02-nopwd-{attempt}"))
                 if attempt < 2:
                     continue
                 return False
             
             time.sleep(1)
-            
             try:
                 sb.click('button[type="submit"]')
             except:
-                try:
-                    sb.click('button')
-                except:
-                    pass
+                sb.click('button')
             
             time.sleep(6)
             sb.save_screenshot(shot(idx, "02-result"))
@@ -312,11 +281,10 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
                 print("[INFO] ✅ 登录成功")
                 return True
             
-            print(f"[WARN] 尝试 {attempt + 1}: 登录未成功，URL: {current_url}")
+            print(f"[WARN] 尝试 {attempt + 1}: 登录未成功")
             
         except Exception as e:
             print(f"[WARN] 尝试 {attempt + 1} 异常: {e}")
-            sb.save_screenshot(shot(idx, f"01-error-{attempt}"))
             if attempt < 2:
                 time.sleep(5)
                 continue
@@ -347,41 +315,17 @@ def get_servers(sb, idx: int) -> List[Dict[str, str]]:
         print("[ERROR] ⚠️ 访问被阻止")
         return []
     
-    matches = re.findall(r'href="[^"]*?/server\?id=(\d+)"', src)
-    for sid in matches:
-        if sid not in seen_ids:
-            seen_ids.add(sid)
-            servers.append({"id": sid, "name": f"Server {sid}"})
-    
-    sb.open(OVERVIEW_URL)
-    time.sleep(3)
-    sb.save_screenshot(shot(idx, "04-overview"))
-    
-    src = sb.get_page_source()
-    matches = re.findall(r'href="[^"]*?/server\?id=(\d+)"', src)
-    for sid in matches:
-        if sid not in seen_ids:
-            seen_ids.add(sid)
-            servers.append({"id": sid, "name": f"Server {sid}"})
-    
-    try:
-        js_servers = sb.execute_script('''
-            (function() {
-                var servers = [];
-                var links = document.querySelectorAll('a[href*="/server?id="]');
-                links.forEach(function(a) {
-                    var match = a.href.match(/id=(\\d+)/);
-                    if (match) servers.push(match[1]);
-                });
-                return [...new Set(servers)];
-            })()
-        ''')
-        if js_servers:
-            for sid in js_servers:
-                if sid not in seen_ids:
-                    seen_ids.add(sid)
-                    servers.append({"id": str(sid), "name": f"Server {sid}"})
-    except: pass
+    for page_url in [DASHBOARD_URL, OVERVIEW_URL]:
+        if page_url != DASHBOARD_URL:
+            sb.open(page_url)
+            time.sleep(3)
+        
+        src = sb.get_page_source()
+        matches = re.findall(r'href="[^"]*?/server\?id=(\d+)"', src)
+        for sid in matches:
+            if sid not in seen_ids:
+                seen_ids.add(sid)
+                servers.append({"id": sid, "name": f"Server {sid}"})
     
     print(f"[INFO] 找到 {len(servers)} 个服务器")
     for s in servers:
@@ -402,20 +346,20 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         result["message"] = "访问被阻止"
         return result
     
+    # 获取续期前时间
     old_renewal = ""
     try:
         old_renewal = sb.execute_script('''
-            (function() {
-                var el = document.getElementById("lastRenewalTime");
-                return el ? el.textContent.trim() : "";
-            })()
-        ''')
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
     except: pass
     
     result["old_time"] = old_renewal
     result["old_time_cn"] = parse_renewal_time(old_renewal)
     print(f"[INFO] 续期前时间: {old_renewal}")
     
+    # 点击续期按钮
     try:
         clicked = sb.execute_script(f'''
             (function() {{
@@ -447,18 +391,20 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         return result
     
     print("[INFO] 已点击续期按钮，等待验证...")
-    time.sleep(3)
+    time.sleep(2)
     sb.save_screenshot(shot(idx, f"srv-{sid}-modal"))
     
-    # 使用智能 Turnstile 处理
+    # 处理 Turnstile
     handle_turnstile(sb, idx)
     
-    time.sleep(5)
+    # 等待页面稳定
+    time.sleep(3)
     
     sp = shot(idx, f"srv-{sid}")
     sb.save_screenshot(sp)
     result["screenshot"] = sp
     
+    # 重新加载检查结果
     sb.open(SERVER_URL.format(sid))
     time.sleep(3)
     
@@ -466,17 +412,13 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     remain = ""
     try:
         new_renewal = sb.execute_script('''
-            (function() {
-                var el = document.getElementById("lastRenewalTime");
-                return el ? el.textContent.trim() : "";
-            })()
-        ''')
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
         remain = sb.execute_script('''
-            (function() {
-                var el = document.getElementById("nextRenewalTime");
-                return el ? el.textContent.trim() : "";
-            })()
-        ''')
+            var el = document.getElementById("nextRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''') or ""
     except: pass
     
     result["new_time"] = new_renewal
@@ -485,6 +427,7 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     
     print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
     
+    # 判断续期结果
     today = datetime.now().strftime('%b %d, %Y')
     if new_renewal and new_renewal != old_renewal:
         result["success"] = True
@@ -578,11 +521,6 @@ def main():
                     results.append(r)
                     if r.get("final_screenshot"):
                         last_shot = r["final_screenshot"]
-                    else:
-                        for s in reversed(r.get("servers", [])):
-                            if s.get("screenshot"):
-                                last_shot = s["screenshot"]
-                                break
                     time.sleep(3)
                 except Exception as e:
                     print(f"[ERROR] 账号 {mask(u)} 异常: {e}")
