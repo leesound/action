@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Zampto 自动续期脚本 - 支持 Invisible Turnstile"""
+"""Zampto 自动续期脚本 - 修复 Turnstile 检测"""
 
 import os, sys, time, platform, requests, re
 from datetime import datetime, timezone, timedelta
@@ -86,34 +86,71 @@ def parse_accounts(s: str) -> List[Tuple[str, str]]:
             if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
 
 def detect_turnstile_type(sb) -> str:
-    """检测 Turnstile 类型"""
+    """检测 Turnstile 类型: visible, invisible, none"""
     try:
         result = sb.execute_script('''
             (function() {
-                var cf = document.querySelector("input[name='cf-turnstile-response']");
-                if (!cf) return "none";
+                // 检查是否有 turnstile 容器
+                var container = document.getElementById('turnstileContainer');
+                var cfInput = document.querySelector("input[name='cf-turnstile-response']");
                 
+                if (!container && !cfInput) {
+                    return "none";
+                }
+                
+                // 检查所有 iframe
                 var iframes = document.querySelectorAll('iframe');
                 for (var i = 0; i < iframes.length; i++) {
-                    var src = iframes[i].src || "";
-                    if (src.includes("turnstile") || src.includes("challenges.cloudflare")) {
-                        var rect = iframes[i].getBoundingClientRect();
-                        if (rect.width > 50 && rect.height > 50) {
+                    var iframe = iframes[i];
+                    var src = iframe.src || "";
+                    
+                    // Cloudflare Turnstile iframe 特征
+                    if (src.includes("challenges.cloudflare.com") || 
+                        src.includes("turnstile")) {
+                        
+                        var rect = iframe.getBoundingClientRect();
+                        var style = window.getComputedStyle(iframe);
+                        var visible = style.display !== 'none' && 
+                                     style.visibility !== 'hidden' &&
+                                     rect.width > 0 && rect.height > 0;
+                        
+                        // 如果 iframe 可见且有一定尺寸，是 visible 类型
+                        if (visible && rect.width > 100 && rect.height > 50) {
                             return "visible";
                         }
                     }
                 }
+                
+                // 检查 cf-turnstile div
+                var cfDiv = document.querySelector('.cf-turnstile, [data-sitekey]');
+                if (cfDiv) {
+                    var rect = cfDiv.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 50) {
+                        return "visible";
+                    }
+                }
+                
+                // 有 container 或 input 但没有可见的 iframe，可能是 invisible 或正在加载
+                // 默认当作 visible 处理（更安全）
+                if (container) {
+                    var rect = container.getBoundingClientRect();
+                    if (rect.height > 50) {
+                        return "visible";
+                    }
+                }
+                
                 return "invisible";
             })()
         ''')
-        return result or "none"
-    except:
-        return "unknown"
+        return result or "unknown"
+    except Exception as e:
+        print(f"[WARN] 检测类型出错: {e}")
+        return "visible"  # 出错时默认 visible，更安全
 
 def wait_turnstile_complete(sb, timeout: int = 60) -> str:
     """
     等待 Turnstile 完成
-    返回: "token" (获取到token), "closed" (modal消失/页面刷新), "timeout" (超时)
+    返回: "token", "closed", "timeout"
     """
     print(f"[INFO] 等待验证完成 (最多 {timeout}s)...")
     
@@ -123,14 +160,13 @@ def wait_turnstile_complete(sb, timeout: int = 60) -> str:
                 (function() {
                     // 检查 modal 是否还存在
                     var modal = document.querySelector('.confirmation-modal-content');
-                    var turnstileContainer = document.getElementById('turnstileContainer');
+                    var container = document.getElementById('turnstileContainer');
                     
-                    // 如果 modal 消失了，说明验证完成并提交了
-                    if (!modal && !turnstileContainer) {
+                    if (!modal && !container) {
                         return "closed";
                     }
                     
-                    // 检查是否获取到 token
+                    // 检查 token
                     var inputs = document.querySelectorAll("input[name='cf-turnstile-response']");
                     for (var j = 0; j < inputs.length; j++) {
                         if (inputs[j].value && inputs[j].value.length > 20) {
@@ -138,7 +174,6 @@ def wait_turnstile_complete(sb, timeout: int = 60) -> str:
                         }
                     }
                     
-                    // modal 还在，继续等待
                     return "waiting";
                 })()
             ''')
@@ -150,12 +185,11 @@ def wait_turnstile_complete(sb, timeout: int = 60) -> str:
                 print(f"[INFO] ✅ Token 已获取 ({i}s)")
                 return "token"
                 
-        except Exception as e:
-            # 如果执行出错，可能是页面正在刷新
+        except:
             print(f"[INFO] ✅ 页面刷新中 ({i}s)")
             return "closed"
         
-        if i % 15 == 0 and i:
+        if i % 10 == 0 and i:
             print(f"[INFO] 等待验证... {i}s")
         time.sleep(1)
     
@@ -164,7 +198,7 @@ def wait_turnstile_complete(sb, timeout: int = 60) -> str:
 
 def handle_turnstile(sb, idx: int) -> bool:
     """智能处理 Turnstile"""
-    time.sleep(2)
+    time.sleep(3)  # 等待 turnstile 完全加载
     
     turnstile_type = detect_turnstile_type(sb)
     print(f"[INFO] Turnstile 类型: {turnstile_type}")
@@ -173,19 +207,19 @@ def handle_turnstile(sb, idx: int) -> bool:
         print("[INFO] 未检测到 Turnstile")
         return True
     
-    if turnstile_type == "invisible":
+    # 对于 visible 或 unknown，都尝试点击
+    if turnstile_type in ("visible", "unknown"):
+        print("[INFO] 尝试 uc_gui_click_captcha...")
+        try:
+            sb.uc_gui_click_captcha()
+            print("[INFO] ✅ 已点击验证")
+            time.sleep(3)
+        except Exception as e:
+            print(f"[WARN] uc_gui_click_captcha 失败: {e}")
+    else:
         print("[INFO] Invisible Turnstile - 等待自动验证...")
-        result = wait_turnstile_complete(sb, 45)
-        return result in ("token", "closed")
     
-    # Visible 模式
-    print("[INFO] Visible Turnstile - 尝试点击...")
-    try:
-        sb.uc_gui_click_captcha()
-        time.sleep(3)
-    except Exception as e:
-        print(f"[WARN] uc_gui_click_captcha 失败: {e}")
-    
+    # 等待验证完成
     result = wait_turnstile_complete(sb, 45)
     return result in ("token", "closed")
 
@@ -208,37 +242,31 @@ def login(sb, user: str, pwd: str, idx: int) -> bool:
             
             for _ in range(10):
                 src = sb.get_page_source()
-                if 'identifier' in src or 'email' in src or 'username' in src:
+                if 'identifier' in src or 'email' in src:
                     break
                 time.sleep(2)
             
-            selectors = [
-                'input[name="identifier"]',
-                'input[type="email"]',
-                'input[type="text"]',
-                '#identifier',
-            ]
+            selectors = ['input[name="identifier"]', 'input[type="email"]', 'input[type="text"]']
             
             input_found = False
             for sel in selectors:
                 try:
                     sb.wait_for_element(sel, timeout=5)
                     print(f"[INFO] 找到输入框: {sel}")
-                    input_found = True
                     sb.type(sel, user)
-                    time.sleep(1)
+                    input_found = True
                     break
                 except:
                     continue
             
             if not input_found:
                 print(f"[WARN] 尝试 {attempt + 1}: 未找到输入框")
-                sb.save_screenshot(shot(idx, f"01-noinput-{attempt}"))
                 if attempt < 2:
                     time.sleep(5)
                     continue
                 return False
             
+            time.sleep(1)
             try:
                 sb.click('button[type="submit"]')
             except:
@@ -346,7 +374,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
         result["message"] = "访问被阻止"
         return result
     
-    # 获取续期前时间
     old_renewal = ""
     try:
         old_renewal = sb.execute_script('''
@@ -397,14 +424,12 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     # 处理 Turnstile
     handle_turnstile(sb, idx)
     
-    # 等待页面稳定
     time.sleep(3)
     
     sp = shot(idx, f"srv-{sid}")
     sb.save_screenshot(sp)
     result["screenshot"] = sp
     
-    # 重新加载检查结果
     sb.open(SERVER_URL.format(sid))
     time.sleep(3)
     
@@ -427,7 +452,6 @@ def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
     
     print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
     
-    # 判断续期结果
     today = datetime.now().strftime('%b %d, %Y')
     if new_renewal and new_renewal != old_renewal:
         result["success"] = True
