@@ -1,411 +1,613 @@
 #!/usr/bin/env python3
-"""Zampto 自动续期脚本 - 优化 Turnstile 验证"""
+# -*- coding: utf-8 -*-
+"""Zampto 自动续期脚本 - 优化版"""
 
-import os
-import sys
-import time
-import json
-import requests
-from datetime import datetime
+import os, sys, time, platform, requests, re
+import signal
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from seleniumbase import SB
 
-# 环境检测
-IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+AUTH_URL = "https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
+DASHBOARD_URL = "https://dash.zampto.net/homepage"
+OVERVIEW_URL = "https://dash.zampto.net/overview"
+SERVER_URL = "https://dash.zampto.net/server?id={}"
+OUTPUT_DIR = Path("output/screenshots")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def log(msg, level="INFO"):
-    print(f"[{level}] {msg}", flush=True)
+CN_TZ = timezone(timedelta(hours=8))
 
-def send_telegram(message):
-    """发送 Telegram 通知"""
-    bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
-    if not bot_token or not chat_id:
-        return
+def cn_now() -> datetime:
+    return datetime.now(CN_TZ)
+
+def cn_time_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return cn_now().strftime(fmt)
+
+def parse_renewal_time(time_str: str) -> str:
+    if not time_str:
+        return "未知"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
-            timeout=30
-        )
+        dt = datetime.strptime(time_str, "%b %d, %Y %I:%M %p")
+        dt = dt.replace(tzinfo=timezone.utc)
+        dt_cn = dt.astimezone(CN_TZ)
+        return dt_cn.strftime("%Y年%m月%d日 %H时%M分")
     except:
-        pass
+        return time_str
 
-def mask_email(email):
-    if "@" not in email:
-        return email[:2] + "***"
-    name, domain = email.split("@", 1)
-    return name[0] + "***@" + domain
+def calc_expiry_time(renewal_time_str: str, minutes: int = 2880) -> str:
+    if not renewal_time_str:
+        return "未知"
+    try:
+        dt = datetime.strptime(renewal_time_str, "%b %d, %Y %I:%M %p")
+        dt = dt.replace(tzinfo=timezone.utc)
+        expiry = dt + timedelta(minutes=minutes)
+        expiry_cn = expiry.astimezone(CN_TZ)
+        return expiry_cn.strftime("%Y年%m月%d日 %H时%M分")
+    except:
+        return "未知"
+
+def mask(s: str, show: int = 1) -> str:
+    if not s: return "***"
+    s = str(s)
+    if len(s) <= show: return s[0] + "***"
+    return s[:show] + "*" * min(3, len(s) - show)
+
+def is_linux(): return platform.system().lower() == "linux"
 
 def setup_display():
-    """设置虚拟显示"""
-    if IN_GITHUB_ACTIONS:
+    if is_linux() and not os.environ.get("DISPLAY"):
         try:
             from pyvirtualdisplay import Display
-            display = Display(visible=False, size=(1920, 1080))
-            display.start()
-            log("虚拟显示已启动")
-            return display
+            d = Display(visible=False, size=(1920, 1080))
+            d.start()
+            os.environ["DISPLAY"] = d.new_display_var
+            print("[INFO] 虚拟显示已启动")
+            return d
         except Exception as e:
-            log(f"虚拟显示启动失败: {e}", "WARN")
+            print(f"[ERROR] 虚拟显示失败: {e}"); sys.exit(1)
     return None
 
-def test_proxy(proxy_url):
-    """测试代理连接"""
-    if not proxy_url:
-        return True
-    try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        resp = requests.get("https://api.ipify.org", proxies=proxies, timeout=15)
-        log("代理连接正常")
-        return True
-    except Exception as e:
-        log(f"代理连接失败: {e}", "ERROR")
-        return False
+def shot(idx: int, name: str) -> str:
+    return str(OUTPUT_DIR / f"acc{idx}-{cn_now().strftime('%H%M%S')}-{name}.png")
 
-def wait_for_turnstile(sb, timeout=120):
-    """
-    等待 Turnstile 验证完成
-    返回: True=成功, False=失败/超时
-    """
-    log("等待 Turnstile 验证...")
-    start_time = time.time()
+def notify(ok: bool, stage: str, msg: str = "", img: str = None):
+    token, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not token or not chat: return
+    try:
+        text = f"🔔 Zampto: {'✅' if ok else '❌'} {stage}\n{msg}\n⏰ {cn_time_str()}"
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": text}, timeout=30)
+        if img and Path(img).exists():
+            with open(img, "rb") as f:
+                requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data={"chat_id": chat}, files={"photo": f}, timeout=60)
+    except: pass
+
+def parse_accounts(s: str) -> List[Tuple[str, str]]:
+    return [(p[0].strip(), p[1].strip()) for line in s.strip().split('\n') 
+            if '----' in line and len(p := line.strip().split('----', 1)) == 2 and p[0].strip() and p[1].strip()]
+
+class TimeoutError(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("操作超时")
+
+def wait_turnstile(sb, wait: int = 90) -> bool:
+    """等待 Turnstile 验证完成"""
+    print("[INFO] 等待 Turnstile 验证...")
+    start = time.time()
     
-    while time.time() - start_time < timeout:
+    for i in range(wait):
+        elapsed = int(time.time() - start)
         try:
-            # 检查是否有成功的 iframe
-            iframes = sb.find_elements("iframe[src*='challenges.cloudflare.com']")
+            # 检查验证是否完成
+            result = sb.execute_script('''
+                (function() {
+                    // 检查 cf-turnstile-response
+                    var cf = document.querySelector("input[name='cf-turnstile-response']");
+                    if (cf && cf.value && cf.value.length > 20) return "done";
+                    
+                    // 检查成功消息
+                    var body = document.body.innerText || "";
+                    if (body.includes("renewed successfully") || 
+                        body.includes("Renewal successful") ||
+                        body.includes("成功")) return "success_msg";
+                    
+                    // 检查是否有验证框
+                    var iframe = document.querySelector('iframe[src*="turnstile"]');
+                    if (iframe) return "has_iframe";
+                    
+                    var widget = document.querySelector('.cf-turnstile');
+                    if (widget) return "has_widget";
+                    
+                    return "waiting";
+                })()
+            ''')
             
-            if not iframes:
-                # 没有 iframe，可能验证已完成或不需要验证
-                log("未检测到 Turnstile iframe，可能已完成")
+            if result == "done":
+                print(f"[INFO] ✅ Turnstile 验证完成 ({elapsed}s)")
+                return True
+            elif result == "success_msg":
+                print(f"[INFO] ✅ 检测到成功消息 ({elapsed}s)")
                 return True
             
-            for iframe in iframes:
-                try:
-                    # 检查 iframe 是否可见
-                    if not iframe.is_displayed():
-                        continue
-                    
-                    # 切换到 iframe
-                    sb.switch_to_frame(iframe)
-                    
-                    # 检查是否有成功标记
-                    try:
-                        success = sb.find_elements("[data-success='true']") or \
-                                  sb.find_elements(".success") or \
-                                  sb.find_elements("[aria-checked='true']")
-                        if success:
-                            sb.switch_to_default_content()
-                            log("✅ Turnstile 验证成功")
-                            return True
-                    except:
-                        pass
-                    
-                    # 检查复选框并尝试点击
-                    try:
-                        checkbox = sb.find_elements("input[type='checkbox']")
-                        if checkbox and not checkbox[0].is_selected():
-                            checkbox[0].click()
-                            log("已点击 Turnstile 复选框")
-                    except:
-                        pass
-                    
-                    sb.switch_to_default_content()
-                except:
-                    sb.switch_to_default_content()
-            
-            # 检查页面是否已经更新（验证通过的标志）
-            try:
-                # 检查是否出现成功提示
-                if sb.is_text_visible("success", timeout=1) or \
-                   sb.is_text_visible("renewed", timeout=1) or \
-                   sb.is_text_visible("extended", timeout=1):
-                    log("✅ 检测到成功提示")
-                    return True
-            except:
-                pass
-            
-            # 检查 Toast 消息
-            try:
-                toasts = sb.find_elements("[class*='toast']") or \
-                         sb.find_elements("[class*='notification']") or \
-                         sb.find_elements("[class*='alert']")
-                for toast in toasts:
-                    text = toast.text.lower()
-                    if "success" in text or "renewed" in text:
-                        log("✅ 检测到成功 Toast")
-                        return True
-                    if "error" in text or "failed" in text:
-                        log(f"❌ 检测到错误: {toast.text}", "ERROR")
-                        return False
-            except:
-                pass
-            
-            time.sleep(2)
-            elapsed = int(time.time() - start_time)
-            if elapsed % 10 == 0:
-                log(f"验证等待中... {elapsed}s/{timeout}s")
+            if i % 10 == 0 and i > 0:
+                print(f"[INFO] 验证等待中... {elapsed}s (状态: {result})")
                 
         except Exception as e:
-            log(f"验证检查异常: {e}", "WARN")
-            time.sleep(2)
+            if i % 20 == 0:
+                print(f"[WARN] 检查验证状态出错: {e}")
+        
+        time.sleep(1)
     
-    log(f"⚠️ Turnstile 验证超时 ({timeout}s)", "WARN")
+    print(f"[WARN] Turnstile 等待超时 ({wait}s)")
     return False
 
-def renew_server(sb, server_id, max_retries=3):
-    """
-    续期单个服务器
-    """
-    for attempt in range(1, max_retries + 1):
+def try_click_turnstile(sb, idx: int) -> bool:
+    """尝试点击 Turnstile 验证"""
+    print("[INFO] 尝试处理 Turnstile...")
+    
+    # 方法1: 使用 JavaScript 点击 iframe 内的复选框
+    try:
+        clicked = sb.execute_script('''
+            (function() {
+                // 尝试找到并点击 turnstile iframe
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || "";
+                    if (src.includes("turnstile") || src.includes("challenges")) {
+                        // 尝试点击 iframe 区域
+                        var rect = iframes[i].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            iframes[i].click();
+                            return "clicked_iframe";
+                        }
+                    }
+                }
+                
+                // 尝试点击 cf-turnstile 容器
+                var widget = document.querySelector('.cf-turnstile');
+                if (widget) {
+                    widget.click();
+                    return "clicked_widget";
+                }
+                
+                return "no_target";
+            })()
+        ''')
+        print(f"[INFO] JS 点击结果: {clicked}")
+    except Exception as e:
+        print(f"[WARN] JS 点击失败: {e}")
+    
+    time.sleep(2)
+    
+    # 方法2: 使用 SeleniumBase 的 uc_gui_click_captcha（带超时）
+    if is_linux():
         try:
-            log(f"续期服务器 {server_id[:4]}*** (尝试 {attempt}/{max_retries})...")
+            print("[INFO] 尝试 uc_gui_click_captcha (最多30秒)...")
             
-            # 访问服务器页面
-            sb.open(f"https://dash.zampto.com/server/{server_id}")
-            sb.sleep(3)
+            # 设置超时
+            if hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(30)
             
-            # 获取当前到期时间
-            expiry_before = None
             try:
-                time_elem = sb.find_element("time") or sb.find_element("[class*='expir']")
-                expiry_before = time_elem.text
-                log(f"续期前到期时间: {expiry_before}")
-            except:
-                pass
+                sb.uc_gui_click_captcha()
+                print("[INFO] uc_gui_click_captcha 完成")
+            except TimeoutError:
+                print("[WARN] uc_gui_click_captcha 超时")
+            finally:
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)
+                    
+        except Exception as e:
+            print(f"[WARN] uc_gui_click_captcha 失败: {e}")
+    
+    time.sleep(2)
+    
+    # 方法3: 切换到 iframe 并点击
+    try:
+        iframes = sb.find_elements('iframe')
+        for iframe in iframes:
+            src = iframe.get_attribute('src') or ""
+            if 'turnstile' in src or 'challenge' in src:
+                print("[INFO] 找到 Turnstile iframe，尝试切换...")
+                sb.switch_to_frame(iframe)
+                time.sleep(1)
+                
+                # 尝试点击复选框
+                try:
+                    sb.click('input[type="checkbox"]')
+                    print("[INFO] 点击了 iframe 内复选框")
+                except:
+                    try:
+                        sb.click('div')
+                        print("[INFO] 点击了 iframe 内 div")
+                    except:
+                        pass
+                
+                sb.switch_to_default_content()
+                break
+    except Exception as e:
+        print(f"[WARN] iframe 处理失败: {e}")
+        try:
+            sb.switch_to_default_content()
+        except:
+            pass
+    
+    time.sleep(2)
+    sb.save_screenshot(shot(idx, "turnstile-after"))
+    return True
+
+def login(sb, user: str, pwd: str, idx: int) -> bool:
+    user_masked = mask(user)
+    print(f"\n{'='*50}\n[INFO] 账号 {idx}: 登录 {user_masked}\n{'='*50}")
+    
+    for attempt in range(3):
+        try:
+            print(f"[INFO] 打开登录页 (尝试 {attempt + 1}/3)...")
+            sb.uc_open_with_reconnect(AUTH_URL, reconnect_time=10.0)
+            time.sleep(5)
             
-            # 查找续期按钮
-            renew_btn = None
+            current_url = sb.get_current_url()
+            if "dash.zampto.net" in current_url:
+                print("[INFO] ✅ 已登录")
+                return True
+            
+            sb.save_screenshot(shot(idx, f"01-login-{attempt}"))
+            
+            for _ in range(10):
+                src = sb.get_page_source()
+                if 'identifier' in src or 'email' in src:
+                    break
+                time.sleep(2)
+            
             selectors = [
-                "button:contains('Renew')",
-                "button:contains('Extend')",
-                "button:contains('续期')",
-                "[class*='renew']",
-                "button[onclick*='renew']",
-                "a:contains('Renew')"
+                'input[name="identifier"]',
+                'input[type="email"]',
+                'input[type="text"]',
+                '#identifier'
             ]
             
-            for selector in selectors:
+            input_found = False
+            for sel in selectors:
                 try:
-                    if sb.is_element_visible(selector, timeout=2):
-                        renew_btn = sb.find_element(selector)
-                        break
+                    sb.wait_for_element(sel, timeout=5)
+                    print(f"[INFO] 找到输入框: {sel}")
+                    sb.type(sel, user)
+                    input_found = True
+                    break
                 except:
                     continue
             
-            if not renew_btn:
-                log("未找到续期按钮，可能已是最长期限", "WARN")
-                return {"status": "skip", "reason": "no_button"}
+            if not input_found:
+                print(f"[WARN] 尝试 {attempt + 1}: 未找到输入框")
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return False
             
-            # 点击续期按钮
-            renew_btn.click()
-            log("已点击续期按钮")
-            sb.sleep(2)
-            
-            # 等待并处理 Turnstile 验证
-            if not wait_for_turnstile(sb, timeout=90):
-                log(f"验证未完成，将重试...", "WARN")
-                continue
-            
-            # 验证后等待页面更新
-            sb.sleep(5)
-            
-            # 检查续期结果
+            time.sleep(1)
             try:
-                # 重新加载页面确认
-                sb.refresh()
-                sb.sleep(3)
-                
-                time_elem = sb.find_element("time") or sb.find_element("[class*='expir']")
-                expiry_after = time_elem.text
-                log(f"续期后到期时间: {expiry_after}")
-                
-                if expiry_before and expiry_after and expiry_before != expiry_after:
-                    log(f"✅ 续期成功: {expiry_before} -> {expiry_after}")
-                    return {"status": "success", "before": expiry_before, "after": expiry_after}
-                elif expiry_after:
-                    log(f"✅ 当前到期时间: {expiry_after}")
-                    return {"status": "success", "after": expiry_after}
-            except Exception as e:
-                log(f"获取到期时间失败: {e}", "WARN")
+                sb.click('button[type="submit"]')
+            except:
+                sb.click('button')
             
-            # 假设成功
-            return {"status": "success", "note": "验证通过，假设续期成功"}
+            time.sleep(4)
+            
+            pwd_found = False
+            for _ in range(15):
+                for sel in ['input[name="password"]', 'input[type="password"]']:
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.type(sel, pwd)
+                            pwd_found = True
+                            print("[INFO] 已输入密码")
+                            break
+                    except:
+                        continue
+                if pwd_found:
+                    break
+                time.sleep(1)
+            
+            if not pwd_found:
+                print("[WARN] 密码页面未加载")
+                if attempt < 2:
+                    continue
+                return False
+            
+            time.sleep(1)
+            try:
+                sb.click('button[type="submit"]')
+            except:
+                sb.click('button')
+            
+            time.sleep(6)
+            sb.save_screenshot(shot(idx, "02-result"))
+            
+            current_url = sb.get_current_url()
+            if "dash.zampto.net" in current_url or "sign-in" not in current_url:
+                print("[INFO] ✅ 登录成功")
+                return True
+            
+            print(f"[WARN] 尝试 {attempt + 1}: 登录未成功")
             
         except Exception as e:
-            log(f"续期异常: {e}", "ERROR")
-            if attempt < max_retries:
-                sb.sleep(5)
+            print(f"[WARN] 尝试 {attempt + 1} 异常: {e}")
+            if attempt < 2:
+                time.sleep(5)
+                continue
     
-    return {"status": "failed", "reason": "max_retries"}
+    print("[ERROR] 登录失败")
+    return False
 
-def login_and_renew(email, password, proxy_url=None):
-    """登录并续期"""
-    from seleniumbase import SB
-    
-    results = {"email": mask_email(email), "servers": [], "error": None}
-    
-    # 浏览器配置
-    sb_config = {
-        "uc": True,  # Undetected Chrome
-        "headless": IN_GITHUB_ACTIONS,
-        "locale_code": "en",
-        "disable_csp": True,
-        "agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    if proxy_url:
-        # SeleniumBase 需要 host:port 格式
-        proxy_parts = proxy_url.replace("socks5://", "").replace("socks://", "")
-        sb_config["proxy"] = f"socks5://{proxy_parts}"
-        log("使用代理模式")
-    
+def logout(sb):
     try:
-        with SB(**sb_config) as sb:
-            # 登录
-            log("打开登录页...")
-            sb.open("https://dash.zampto.com/auth/login")
-            sb.sleep(3)
-            
-            # 输入邮箱
-            sb.type("input[name='identifier']", email)
-            sb.sleep(1)
-            
-            # 点击继续或下一步
-            try:
-                sb.click("button[type='submit']")
-                sb.sleep(2)
-            except:
-                pass
-            
-            # 输入密码
-            try:
-                sb.type("input[name='password']", password)
-                sb.type("input[type='password']", password)
-            except:
-                pass
-            sb.sleep(1)
-            
-            # 提交登录
-            sb.click("button[type='submit']")
-            log("已提交登录")
-            
-            # 等待登录完成
-            sb.sleep(5)
-            
-            # 检查是否登录成功
-            if "login" in sb.get_current_url().lower():
-                # 可能需要处理 Turnstile
-                wait_for_turnstile(sb, timeout=60)
-                sb.sleep(3)
-            
-            if "dashboard" in sb.get_current_url().lower() or "server" in sb.get_current_url().lower():
-                log("✅ 登录成功")
-            else:
-                log(f"当前 URL: {sb.get_current_url()}")
-            
-            # 获取服务器列表
-            log("获取服务器列表...")
-            sb.open("https://dash.zampto.com/servers")
-            sb.sleep(3)
-            
-            # 查找服务器
-            servers = []
-            try:
-                # 查找服务器链接
-                links = sb.find_elements("a[href*='/server/']")
-                for link in links:
-                    href = link.get_attribute("href")
-                    if "/server/" in href:
-                        server_id = href.split("/server/")[-1].split("/")[0].split("?")[0]
-                        if server_id and server_id not in servers:
-                            servers.append(server_id)
-            except:
-                pass
-            
-            if not servers:
-                log("未找到服务器", "WARN")
-                results["error"] = "no_servers"
-                return results
-            
-            log(f"找到 {len(servers)} 个服务器")
-            for sid in servers:
-                log(f"  - ID: {sid[:4]}***")
-            
-            # 续期每个服务器
-            for server_id in servers:
-                result = renew_server(sb, server_id)
-                results["servers"].append({
-                    "id": server_id[:4] + "***",
-                    **result
-                })
+        sb.delete_all_cookies()
+        sb.open("about:blank")
+        time.sleep(1)
+        print("[INFO] 已退出登录")
+    except Exception as e:
+        print(f"[WARN] 退出时出错: {e}")
+
+def get_servers(sb, idx: int) -> List[Dict[str, str]]:
+    print("[INFO] 获取服务器列表...")
+    servers = []
+    seen_ids = set()
+    
+    sb.open(DASHBOARD_URL)
+    time.sleep(5)
+    sb.save_screenshot(shot(idx, "03-dashboard"))
+    
+    src = sb.get_page_source()
+    if "Access Blocked" in src or "VPN or Proxy Detected" in src:
+        print("[ERROR] ⚠️ 访问被阻止")
+        return []
+    
+    for page_url in [DASHBOARD_URL, OVERVIEW_URL]:
+        if page_url != DASHBOARD_URL:
+            sb.open(page_url)
+            time.sleep(3)
+        
+        src = sb.get_page_source()
+        matches = re.findall(r'href="[^"]*?/server\?id=(\d+)"', src)
+        for sid in matches:
+            if sid not in seen_ids:
+                seen_ids.add(sid)
+                servers.append({"id": sid, "name": f"Server {sid}"})
+    
+    print(f"[INFO] 找到 {len(servers)} 个服务器")
+    for s in servers:
+        print(f"  - ID: {mask(s['id'])}")
+    return servers
+
+def renew(sb, sid: str, idx: int) -> Dict[str, Any]:
+    sid_masked = mask(sid)
+    result = {"server_id": sid, "success": False, "message": "", "screenshot": None, 
+              "old_time": "", "new_time": "", "old_time_cn": "", "new_time_cn": "", "expiry_cn": ""}
+    print(f"[INFO] 续期服务器 {sid_masked}...")
+    
+    sb.open(SERVER_URL.format(sid))
+    time.sleep(4)
+    
+    src = sb.get_page_source()
+    if "Access Blocked" in src:
+        result["message"] = "访问被阻止"
+        return result
+    
+    # 获取续期前时间
+    old_renewal = ""
+    try:
+        old_renewal = sb.execute_script('''
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''')
+    except: pass
+    
+    result["old_time"] = old_renewal
+    result["old_time_cn"] = parse_renewal_time(old_renewal)
+    print(f"[INFO] 续期前时间: {old_renewal}")
+    
+    # 点击续期按钮
+    try:
+        clicked = sb.execute_script(f'''
+            (function() {{
+                var links = document.querySelectorAll('a[onclick*="handleServerRenewal"]');
+                for (var i = 0; i < links.length; i++) {{
+                    if (links[i].getAttribute('onclick').includes('{sid}')) {{
+                        links[i].click();
+                        return true;
+                    }}
+                }}
+                var btns = document.querySelectorAll('a.action-button, button');
+                for (var i = 0; i < btns.length; i++) {{
+                    if (btns[i].textContent.toLowerCase().includes('renew')) {{
+                        btns[i].click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        ''')
+        
+        if not clicked:
+            result["message"] = "未找到续期按钮"
+            sb.save_screenshot(shot(idx, f"srv-{sid}-nobtn"))
+            return result
             
     except Exception as e:
-        log(f"执行异常: {e}", "ERROR")
-        results["error"] = str(e)
+        result["message"] = f"点击失败: {e}"
+        return result
     
-    return results
+    print("[INFO] 已点击续期按钮")
+    time.sleep(3)
+    sb.save_screenshot(shot(idx, f"srv-{sid}-clicked"))
+    
+    # 处理 Turnstile 验证
+    try_click_turnstile(sb, idx)
+    
+    # 等待验证完成
+    turnstile_ok = wait_turnstile(sb, 90)
+    
+    if not turnstile_ok:
+        print("[WARN] Turnstile 可能未完成，继续检查结果...")
+    
+    time.sleep(3)
+    
+    sp = shot(idx, f"srv-{sid}")
+    sb.save_screenshot(sp)
+    result["screenshot"] = sp
+    
+    # 重新加载页面检查结果
+    sb.open(SERVER_URL.format(sid))
+    time.sleep(4)
+    
+    new_renewal = ""
+    remain = ""
+    try:
+        new_renewal = sb.execute_script('''
+            var el = document.getElementById("lastRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''')
+        remain = sb.execute_script('''
+            var el = document.getElementById("nextRenewalTime");
+            return el ? el.textContent.trim() : "";
+        ''')
+    except: pass
+    
+    result["new_time"] = new_renewal
+    result["new_time_cn"] = parse_renewal_time(new_renewal)
+    result["expiry_cn"] = calc_expiry_time(new_renewal)
+    
+    print(f"[INFO] 续期后时间: {new_renewal}, 剩余: {remain}")
+    
+    today = datetime.now().strftime('%b %d, %Y')
+    if new_renewal and new_renewal != old_renewal:
+        result["success"] = True
+        result["message"] = f"{result['old_time_cn']} -> {result['expiry_cn']}"
+    elif today in str(new_renewal):
+        result["success"] = True
+        result["message"] = f"今日已续期 | {result['new_time_cn']} -> {result['expiry_cn']}"
+    elif remain and ("1 day" in remain or "2 day" in remain or "hour" in remain):
+        result["success"] = True
+        result["message"] = f"{result['new_time_cn']} -> {result['expiry_cn']}"
+    else:
+        result["message"] = f"状态未知 | {result['new_time_cn']}"
+    
+    result_shot = shot(idx, f"srv-{sid}-result")
+    sb.save_screenshot(result_shot)
+    result["screenshot"] = result_shot
+    
+    print(f"[INFO] {'✅' if result['success'] else '⚠️'} {result['message']}")
+    return result
+
+def process(sb, user: str, pwd: str, idx: int) -> Dict[str, Any]:
+    result = {"username": user, "success": False, "message": "", "servers": []}
+    
+    if not login(sb, user, pwd, idx):
+        result["message"] = "登录失败"
+        return result
+    
+    servers = get_servers(sb, idx)
+    if not servers:
+        result["message"] = "无服务器或访问被阻止"
+        logout(sb)
+        return result
+    
+    for srv in servers:
+        try:
+            r = renew(sb, srv["id"], idx)
+            r["name"] = srv.get("name", srv["id"])
+            result["servers"].append(r)
+            time.sleep(3)
+        except Exception as e:
+            print(f"[ERROR] 服务器 {mask(srv['id'])} 续期异常: {e}")
+            result["servers"].append({"server_id": srv["id"], "success": False, "message": str(e)})
+    
+    ok = sum(1 for s in result["servers"] if s.get("success"))
+    result["success"] = ok > 0
+    result["message"] = f"{ok}/{len(result['servers'])} 成功"
+    
+    sb.open(DASHBOARD_URL)
+    time.sleep(2)
+    final_shot = shot(idx, "05-final")
+    sb.save_screenshot(final_shot)
+    result["final_screenshot"] = final_shot
+    
+    logout(sb)
+    return result
 
 def main():
-    log(f"Zampto 自动续期 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 获取账号
-    accounts_str = os.environ.get("ZAMPTO_ACCOUNT", "").strip()
-    if not accounts_str:
-        log("未配置 ZAMPTO_ACCOUNT", "ERROR")
+    acc_str = os.environ.get("ZAMPTO_ACCOUNT", "")
+    if not acc_str:
+        print("[ERROR] 缺少 ZAMPTO_ACCOUNT")
         sys.exit(1)
     
-    accounts = [a.strip() for a in accounts_str.split("\n") if a.strip() and "----" in a]
-    log(f"共 {len(accounts)} 个账号")
+    accounts = parse_accounts(acc_str)
+    if not accounts:
+        print("[ERROR] 无有效账号")
+        sys.exit(1)
     
-    # 代理配置
-    proxy_url = os.environ.get("PROXY_SOCKS5", "").strip()
-    if proxy_url:
-        if not test_proxy(proxy_url):
-            log("代理不可用，尝试直连", "WARN")
-            proxy_url = None
+    print(f"[INFO] {len(accounts)} 个账号")
     
-    # 设置虚拟显示
+    proxy = os.environ.get("PROXY_SOCKS5", "")
+    if proxy:
+        try:
+            requests.get("https://api.ipify.org", proxies={"http": proxy, "https": proxy}, timeout=10)
+            print("[INFO] 代理连接正常")
+        except Exception as e:
+            print(f"[WARN] 代理测试失败: {e}")
+    
     display = setup_display()
+    results, last_shot = [], None
     
-    # 处理每个账号
-    all_results = []
-    success_count = 0
-    
-    for i, account in enumerate(accounts, 1):
-        email, password = account.split("----", 1)
-        log(f"\n{'='*50}")
-        log(f"账号 {i}/{len(accounts)}: {mask_email(email)}")
-        log(f"{'='*50}")
+    try:
+        opts = {"uc": True, "test": True, "locale": "en", "headed": not is_linux()}
+        if proxy:
+            opts["proxy"] = proxy
+            print("[INFO] 使用代理模式")
         
-        result = login_and_renew(email, password, proxy_url)
-        all_results.append(result)
-        
-        if result.get("servers"):
-            for srv in result["servers"]:
-                if srv.get("status") == "success":
-                    success_count += 1
+        with SB(**opts) as sb:
+            for i, (u, p) in enumerate(accounts, 1):
+                try:
+                    r = process(sb, u, p, i)
+                    results.append(r)
+                    if r.get("final_screenshot"):
+                        last_shot = r["final_screenshot"]
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"[ERROR] 账号 {mask(u)} 异常: {e}")
+                    results.append({"username": u, "success": False, "message": str(e), "servers": []})
+            
+    except Exception as e:
+        print(f"[ERROR] 脚本异常: {e}")
+        notify(False, "错误", str(e))
+        sys.exit(1)
+    finally:
+        if display:
+            display.stop()
     
-    # 汇总
-    log(f"\n{'='*50}")
-    log(f"续期完成: {success_count} 个服务器成功")
+    ok_acc = sum(1 for r in results if r.get("success"))
+    total_srv = sum(len(r.get("servers", [])) for r in results)
+    ok_srv = sum(sum(1 for s in r.get("servers", []) if s.get("success")) for r in results)
     
-    # 发送通知
-    msg_lines = [f"🖥️ <b>Zampto 续期报告</b>", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
-    for r in all_results:
-        msg_lines.append(f"\n👤 {r['email']}")
-        if r.get("error"):
-            msg_lines.append(f"  ❌ 错误: {r['error']}")
-        for srv in r.get("servers", []):
-            status = "✅" if srv.get("status") == "success" else "❌"
-            msg_lines.append(f"  {status} {srv['id']}: {srv.get('after', srv.get('reason', 'unknown'))}")
+    log_summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
+    for r in results:
+        log_summary += f"{'✅' if r.get('success') else '❌'} {mask(r['username'])}: {r.get('message','')}\n"
+        for s in r.get("servers", []):
+            log_summary += f"  {'✓' if s.get('success') else '✗'} Server {mask(s['server_id'])}: {s.get('message','')}\n"
     
-    send_telegram("\n".join(msg_lines))
+    print(f"\n{'='*50}\n{log_summary}{'='*50}")
     
-    # 清理
-    if display:
-        display.stop()
+    notify_summary = f"📊 账号: {ok_acc}/{len(results)} | 服务器: {ok_srv}/{total_srv}\n{'─'*30}\n"
+    for r in results:
+        notify_summary += f"{'✅' if r.get('success') else '❌'} {r['username']}: {r.get('message','')}\n"
+        for s in r.get("servers", []):
+            status = '✓' if s.get('success') else '✗'
+            notify_summary += f"  {status} Server {s['server_id']}: {s.get('message','')}\n"
     
-    sys.exit(0 if success_count > 0 else 1)
+    notify(ok_acc == len(results) and ok_srv == total_srv, "完成", notify_summary, last_shot)
+    sys.exit(0 if ok_srv > 0 else 1)
 
 if __name__ == "__main__":
     main()
