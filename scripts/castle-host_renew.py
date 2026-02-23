@@ -71,19 +71,16 @@ class Config:
 
 
 def ensure_output_dir():
-    """确保输出目录存在"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
-    """生成截图路径"""
     timestamp = datetime.now().strftime("%H%M%S")
     filename = f"acc{account_idx + 1}_{server_id}_{stage}_{timestamp}.png"
     return str(OUTPUT_DIR / filename)
 
 
 def mask_id(sid: str) -> str:
-    """掩码显示ID（仅用于日志）"""
     return f"{sid[0]}***{sid[-2:]}" if len(sid) > 3 else sid
 
 
@@ -127,7 +124,6 @@ class Notifier:
         self.token, self.chat_id = token, chat_id
 
     async def send_photo(self, caption: str, photo_path: str) -> Optional[int]:
-        """发送带图片的消息"""
         if not self.token or not self.chat_id:
             return None
         
@@ -137,13 +133,11 @@ class Notifier:
         try:
             async with aiohttp.ClientSession() as session:
                 url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                
                 with open(photo_path, 'rb') as photo_file:
                     data = aiohttp.FormData()
                     data.add_field('chat_id', self.chat_id)
                     data.add_field('caption', caption)
                     data.add_field('photo', photo_file, filename='screenshot.png', content_type='image/png')
-                    
                     async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=60)) as r:
                         if r.status == 200:
                             logger.info("✅ 通知已发送（带截图）")
@@ -155,7 +149,6 @@ class Notifier:
             return await self.send(caption)
 
     async def send(self, msg: str) -> Optional[int]:
-        """发送纯文本消息"""
         if not self.token or not self.chat_id:
             return None
         try:
@@ -214,7 +207,6 @@ class CastleClient:
         self.account_idx = account_idx
 
     async def take_screenshot(self, server_id: str, stage: str) -> str:
-        """截图并返回路径（日志不显示完整路径）"""
         try:
             path = screenshot_path(self.account_idx, server_id, stage)
             await self.page.screenshot(path=path, full_page=True)
@@ -223,19 +215,6 @@ class CastleClient:
         except Exception as e:
             logger.error(f"❌ 截图失败: {e}")
             return ""
-
-    async def get_csrf_token(self) -> Optional[str]:
-        """获取当前页面的 CSRF token"""
-        try:
-            csrf_meta = self.page.locator('meta[name="csrf-token"]')
-            if await csrf_meta.count() > 0:
-                token = await csrf_meta.get_attribute('content')
-                if token:
-                    logger.info(f"🔑 获取CSRF token成功")
-                    return token
-        except Exception as e:
-            logger.error(f"❌ 获取CSRF token失败: {e}")
-        return None
 
     async def get_server_ids(self) -> List[str]:
         try:
@@ -249,6 +228,28 @@ class CastleClient:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
 
+    async def check_server_running(self) -> bool:
+        """检查服务器是否运行中"""
+        try:
+            # 方法1: 检查状态文本 "Сервер запущен"
+            running_text = self.page.locator('.shard-value:has-text("Сервер запущен")')
+            if await running_text.count() > 0:
+                return True
+            
+            # 方法2: 检查绿色状态图标
+            green_icon = self.page.locator('i.bi-hdd-stack.text-success')
+            if await green_icon.count() > 0:
+                return True
+            
+            # 方法3: 检查是否有启动按钮（有则说明未运行）
+            start_btn = self.page.locator('a.btn-control:has-text("Запустить")')
+            if await start_btn.count() > 0 and await start_btn.is_visible():
+                return False
+            
+            return True  # 默认认为运行中
+        except:
+            return True
+
     async def start_if_stopped(self, sid: str) -> bool:
         """进入控制页，如果服务器关机则启动"""
         masked = mask_id(sid)
@@ -256,95 +257,117 @@ class CastleClient:
             await self.page.goto(f"{self.BASE}/servers/control/index/{sid}", wait_until="networkidle")
             await self.page.wait_for_timeout(2000)
 
-            for sel in [
-                f"a[onclick*=\"sendActionStatus({sid},'start')\"]",
-                'a.btn-control:has-text("Запустить")',
-                'a.btn-control:has(i.bi-play)',
-            ]:
-                btn = self.page.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    csrf_token = await self.get_csrf_token()
-                    
-                    if csrf_token:
-                        logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
-                        await self.page.request.post(
-                            f"{self.BASE}/servers/control/action/{sid}/start",
-                            headers={
-                                "X-CSRF-TOKEN": csrf_token,
-                                "X-Requested-With": "XMLHttpRequest",
-                            }
-                        )
-                        await self.page.wait_for_timeout(3000)
-                        logger.info(f"🟢 服务器 {masked} 启动指令已发送")
-                        return True
-                    else:
-                        await btn.click()
-                        await self.page.wait_for_timeout(5000)
-                        logger.info(f"🟢 服务器 {masked} 启动指令已发送")
-                        return True
+            # 检查是否已运行
+            if await self.check_server_running():
+                logger.info(f"✅ 服务器 {masked} 运行中")
+                return False
 
-            logger.info(f"✅ 服务器 {masked} 运行中")
+            # 服务器未运行，尝试启动
+            logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
+            
+            # 使用页面内 JavaScript 发送启动请求
+            result = await self.page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const token = document.querySelector('meta[name="csrf-token"]')?.content;
+                        if (!token) return {{ success: false, error: 'No CSRF token' }};
+                        
+                        const response = await fetch('/servers/control/action/{sid}/start', {{
+                            method: 'POST',
+                            headers: {{
+                                'X-CSRF-TOKEN': token,
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Accept': 'application/json'
+                            }}
+                        }});
+                        const data = await response.json();
+                        return {{ success: true, data: data }};
+                    }} catch (e) {{
+                        return {{ success: false, error: e.message }};
+                    }}
+                }}
+            """)
+            
+            if result.get('success'):
+                await self.page.wait_for_timeout(5000)
+                logger.info(f"🟢 服务器 {masked} 启动指令已发送")
+                return True
+            else:
+                logger.error(f"❌ 启动失败: {result.get('error')}")
+                # 尝试点击按钮作为备选
+                start_btn = self.page.locator('a.btn-control:has-text("Запустить")').first
+                if await start_btn.count() > 0:
+                    await start_btn.click()
+                    await self.page.wait_for_timeout(5000)
+                    logger.info(f"🟢 服务器 {masked} 启动指令已发送(点击)")
+                    return True
+
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
         return False
 
-    async def get_expiry_and_prepare(self, sid: str) -> Tuple[str, Optional[str]]:
-        """获取到期时间，并返回最新的 CSRF token"""
-        masked = mask_id(sid)
+    async def get_expiry(self, sid: str) -> str:
+        """获取到期时间"""
         try:
             await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
             await self.page.wait_for_timeout(1500)
             
             content = await self.page.text_content("body")
             match = re.search(r"(\d{2}\.\d{2}\.\d{4})", content)
-            expiry = match.group(1) if match else ""
-            
-            csrf_token = await self.get_csrf_token()
-            
-            return expiry, csrf_token
+            return match.group(1) if match else ""
         except Exception as e:
             logger.error(f"❌ 获取到期时间失败: {e}")
-            return "", None
+            return ""
 
-    async def renew(self, sid: str, csrf_token: str) -> Tuple[RenewalStatus, str, str]:
-        """续约服务器"""
+    async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str]:
+        """续约服务器 - 使用页面内 JavaScript 执行"""
         masked = mask_id(sid)
         screenshot_file = ""
         
         try:
-            if not csrf_token:
-                logger.error(f"❌ 服务器 {masked} 无效的CSRF token")
-                screenshot_file = await self.take_screenshot(sid, "error")
-                return RenewalStatus.FAILED, "无效的CSRF token", screenshot_file
-            
+            # 确保在 pay 页面
             current_url = self.page.url
             if f"/pay/index/{sid}" not in current_url:
                 await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
-                await self.page.wait_for_timeout(1000)
-                csrf_token = await self.get_csrf_token()
-                if not csrf_token:
-                    screenshot_file = await self.take_screenshot(sid, "error")
-                    return RenewalStatus.FAILED, "重新获取CSRF token失败", screenshot_file
+                await self.page.wait_for_timeout(1500)
             
-            response = await self.page.request.post(
-                f"{self.BASE}/servers/pay/buy_months/{sid}",
-                headers={
-                    "X-CSRF-TOKEN": csrf_token,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                }
-            )
+            # 使用页面内 JavaScript 发送续约请求（自动携带正确的 cookies 和 headers）
+            result = await self.page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const token = document.querySelector('meta[name="csrf-token"]')?.content;
+                        if (!token) return {{ success: false, error: 'No CSRF token found' }};
+                        
+                        const response = await fetch('/servers/pay/buy_months/{sid}', {{
+                            method: 'POST',
+                            headers: {{
+                                'X-CSRF-TOKEN': token,
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                            }},
+                            credentials: 'same-origin'
+                        }});
+                        
+                        const data = await response.json();
+                        return {{ success: true, status: response.status, data: data }};
+                    }} catch (e) {{
+                        return {{ success: false, error: e.message }};
+                    }}
+                }}
+            """)
             
             logger.info(f"🖱️ 服务器 {masked} 已请求续约")
             
-            try:
-                data = await response.json()
-            except:
-                logger.error(f"❌ 响应解析失败")
+            if not result.get('success'):
+                error_msg = result.get('error', '请求失败')
+                logger.error(f"❌ 请求失败: {error_msg}")
                 screenshot_file = await self.take_screenshot(sid, "error")
-                return RenewalStatus.FAILED, "响应解析失败", screenshot_file
+                return RenewalStatus.FAILED, error_msg, screenshot_file
             
+            data = result.get('data', {})
+            
+            # 刷新页面获取最新状态
             await self.page.reload(wait_until="networkidle")
             await self.page.wait_for_timeout(1000)
             
@@ -361,7 +384,8 @@ class CastleClient:
                 screenshot_file = await self.take_screenshot(sid, "success")
                 return RenewalStatus.SUCCESS, "续约成功", screenshot_file
             
-            logger.info(f"📝 结果: 未知响应")
+            # 未知响应
+            logger.info(f"📝 结果: 未知响应 {data}")
             screenshot_file = await self.take_screenshot(sid, "unknown")
             return RenewalStatus.FAILED, str(data), screenshot_file
             
@@ -420,22 +444,21 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                 masked = mask_id(sid)
                 logger.info(f"--- 处理服务器 {masked} ---")
                 
+                # 启动服务器（如果关机）
                 started = await client.start_if_stopped(sid)
-                expiry, csrf_token = await client.get_expiry_and_prepare(sid)
+                
+                # 获取到期时间
+                expiry = await client.get_expiry(sid)
                 d = days_left(expiry)
                 logger.info(f"📅 到期: {convert_date(expiry)} ({d}天)")
                 
-                if csrf_token:
-                    status, msg, screenshot = await client.renew(sid, csrf_token)
-                else:
-                    logger.error(f"❌ 服务器 {masked} 无法获取CSRF token")
-                    screenshot = await client.take_screenshot(sid, "error")
-                    status, msg = RenewalStatus.FAILED, "无法获取CSRF token"
+                # 续约
+                status, msg, screenshot = await client.renew(sid)
                 
                 results.append(ServerResult(sid, status, msg, expiry, d, started, screenshot))
                 await asyncio.sleep(2)
 
-            # 发送通知（显示完整信息）
+            # 发送通知
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
                     status_icon = "✅"
@@ -453,7 +476,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                     f"🖥️ Castle-Host 自动续约\n\n"
                     f"状态: {status_icon} {status_text}\n"
                     f"账号: #{idx + 1}\n\n"
-                    f"🖥️ 服务器: {r.server_id}\n"
+                    f"💻 服务器: {r.server_id}\n"
                     f"📅 到期: {convert_date(r.expiry)}\n"
                     f"⏳ 剩余: {r.days} 天\n"
                     f"{started_line}\n"
